@@ -1,0 +1,69 @@
+{
+  "providers": [
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/background.png",
+      "height": 234,
+      "ascent": 25,
+      "chars": [
+        ""
+      ]
+    },
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/head_frame_idle.png",
+      "height": 24,
+      "ascent": -1,
+      "chars": [
+        ""
+      ]
+    },
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/head_frame_ready.png",
+      "height": 24,
+      "ascent": -1,
+      "chars": [
+        ""
+      ]
+    },
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/warn_panel.png",
+      "height": 95,
+      "ascent": 13,
+      "chars": [
+        ""
+      ]
+    },
+    {
+      "type": "space",
+      "advances": {
+        "‌": 0,
+        " ": 4,
+        "": 1,
+        "": -1,
+        "": 2,
+        "": -2,
+        "": 4,
+        "": -4,
+        "": 8,
+        "": -8,
+        "": 16,
+        "": -16,
+        "": 32,
+        "": -32,
+        "": 64,
+        "": -64,
+        "": 128,
+        "": -128,
+        "": 256,
+        "": -256,
+        "": 512,
+        "": -512,
+        "": 1024,
+        "": -1024
+      }
+    }
+  ]
+}

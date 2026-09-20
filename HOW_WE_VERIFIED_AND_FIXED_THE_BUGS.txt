@@ -1,0 +1,993 @@
+================================================================================
+BETTERTRADES - HOW WE VERIFIED AND FIXED THE BUGS
+================================================================================
+Project : BetterTrades 0.1.0-mc1.21.1
+Stack   : Fabric loader 0.16.5 / Fabric API 0.104.0 / Yarn 1.21.1+build.3 / Java 21
+Depends : Cobblemon 1.7.3, Polymer 0.9.15, sgui 1.6.1, SQLite 3.46.1.3,
+          MariaDB 3.4.1, LuckPerms 5.4 (optional), Impactor 5.3.5 (optional)
+Scope   : the whole mod - 44 .java files, schema.sql, fabric.mod.json,
+          bettertrades.mixins.json, the test suite
+
+This is the record of the audit BetterTrades went through before release, and of
+what was changed because of it. 56 findings, all closed. It is published for two
+reasons.
+
+The first: a trading mod moves other people's items, Pokemon and money. If it has
+a duplication bug, a server's economy is finished and nobody can tell you when it
+started. Anyone running one deserves to know how hard it was looked at.
+
+The second: the last section says what has NOT been verified. Every audit has a
+boundary. Ours is written down instead of implied.
+
+Nothing here is marketing. Where a fix has a known limit, the limit is stated
+next to it.
+
+
+--------------------------------------------------------------------------------
+HOW TO READ THIS FILE
+--------------------------------------------------------------------------------
+PART 1   How the code was examined, round by round
+PART 2   Round 1 - 21 findings on the original code
+PART 3   Hypotheses checked and discarded
+PART 4   Regressions caused by our own fixes, found and closed
+PART 5   Round 2 - 12 findings on the corrected code
+PART 6   Round 3 - 23 findings, mostly on the paths the first two rounds had
+         only half covered
+PART 7   What is still not verified
+
+Severities are the ones used during the audit:
+
+  CRITICAL  item or money duplication, or permanent loss, on a reachable path
+  HIGH      the same, but needing a rarer condition; or a control bypassed
+  MEDIUM    players stuck, a feature silently dead, a resource leak
+  LOW       wrong message, a command failing for the wrong reason
+  INFO      no defect today, but a trap laid for the next change
+
+
+================================================================================
+PART 1 - HOW THE CODE WAS EXAMINED
+================================================================================
+
+The audit ran in several rounds. Each one re-read the code the previous round
+had left behind, so the fixes were audited as much as the original.
+
+What the findings rest on:
+
+  * Full reads of every source file, schema.sql and the mod metadata.
+
+  * Bytecode of the real dependency jars, not documentation. javap on Cobblemon
+    1.7.3+1.21.1 settled what TradeManager.onAccept and canAccept really do,
+    where performTrade fires its events, what PokemonStore.add returns, and what
+    setFriendship's default argument is. The sgui 1.6.1 sources settled that its
+    click handling always cancels vanilla slot handling, which is what rules out
+    a whole class of duplication. The Fabric networking sources settled that
+    DISCONNECT is fired from two different threads.
+
+  * The remapped Minecraft jar. PlayerInventory.insertStack returns
+    `stack.getCount() < originalCount` - "I inserted something", not "I inserted
+    all of it". That one line is the root of finding 2.4.
+
+  * A real server. An isolated copy of a 44-mod production server, Temurin 21,
+    the mod jar rebuilt from source. Clean start, escrow.db created with the full
+    schema, language files generated, the mod's three threads alive. Two findings
+    were reproduced there A/B - the old jar against the fixed jar - and one from
+    the console.
+
+  * Isolated probes for the questions a server cannot answer cheaply. A JDBC
+    probe on sqlite-jdbc 3.46.1.3 established what executeBatch returns for an
+    UPDATE that touches no rows ("1 0 0" across three statements), which is what
+    the double-close detector depends on. A standalone harness established that
+    CompletableFuture.AsyncSupply.run() skips the supplier entirely when the
+    future is already complete - the mechanism behind finding 5.2, the one that
+    can make a refund never run at all.
+
+  * ./gradlew build on every round. The suite grew from 1 test to 15 as the
+    fixes landed.
+
+What was NOT used: no two-client play session, no debugger session on a live
+trade, no heap profiling. See PART 7.
+
+
+================================================================================
+PART 2 - ROUND 1: 21 FINDINGS ON THE ORIGINAL CODE
+================================================================================
+
+Ordered as the audit ordered them: duplication and economy first, then data
+loss, race conditions, gameplay, leaks, database consistency, lifecycle.
+
+
+--------------------------------------------------------------------------------
+2.1 [CRITICAL] The DISCONNECT handler mutated a trade from the wrong thread
+--------------------------------------------------------------------------------
+Fabric fires ServerPlayConnectionEvents.DISCONNECT from two places: one on the
+server thread, one on Netty's event loop. On an abrupt disconnect - TCP reset,
+client crash, process killed - the Netty one arrives first. The handler called
+session.cancel() directly, so cancel() ran on a network thread while the server
+thread could be inside commit() on the same objects. None of the session's state
+was synchronised.
+
+Three outcomes from one chain: the same ItemStack instance handed to two
+inventories at once (duplication), the `stage == CLOSED` guard passed by both
+threads (double return, double resolve), and ConcurrentModificationException
+while the other thread iterated the offers.
+
+FIXED - the entire body of the DISCONNECT handler runs inside server.execute().
+One thread touches a session, always.
+
+
+--------------------------------------------------------------------------------
+2.2 [CRITICAL] Escrow did not survive a MariaDB/SQLite failover: items came back twice
+--------------------------------------------------------------------------------
+The escrow row was written to whichever backend was active at the time, but
+resolved and read back on whichever backend was active later. The replay queue
+copied trades, blacklist rules and API clients between backends - never escrow.
+
+The sequence: A offers 64 diamonds, the row is HELD on MariaDB. MariaDB goes
+down, the mod falls back to SQLite. The trade completes, B really receives the
+diamonds, and the resolve runs against SQLite where the row does not exist -
+zero rows updated, no error, no log line. MariaDB comes back. A logs out and in,
+the login scan finds the HELD row still sitting on MariaDB, and hands A a second
+set of 64 diamonds.
+
+Starting quantity 64, final quantity 128. Permanent, not a millisecond window.
+
+FIXED - escrow no longer lives on the active backend at all. It has a dedicated
+local SQLite file, config/bettertrades/escrow.db, with its own connection and its
+own worker thread (db/EscrowDb.java). One physical place for a state that maps to
+one physical inventory. A failover cannot move it any more.
+
+
+--------------------------------------------------------------------------------
+2.3 [HIGH] The mirror image: escrow written to the fallback and never read again
+--------------------------------------------------------------------------------
+Same root cause, opposite direction. An item offered while on SQLite, with the
+owner disconnecting before the trade closed, left a HELD row on SQLite. Once
+MariaDB was back, the login scan queried MariaDB, where that row had never
+existed. The items were gone for good, with no log line at all.
+
+FIXED - the same single local escrow file as 2.2. There is no longer a direction
+for the state to diverge in.
+
+
+--------------------------------------------------------------------------------
+2.4 [HIGH] Partial inserts destroyed the remainder
+--------------------------------------------------------------------------------
+    if (!player.getInventory().insertStack(stack)) player.dropItem(stack, false);
+
+PlayerInventory.insertStack returns true when it inserted *anything*, not when it
+inserted everything: the remainder stays in the passed ItemStack, and the caller
+threw it away. dropItem only ran when nothing at all had fitted. Verified on the
+remapped 1.21.1 bytecode.
+
+Most reachable on the login return path, where nothing checks capacity upstream.
+
+FIXED - the leftover stack is checked after the insert and dropped on the ground
+instead of being discarded.
+
+
+--------------------------------------------------------------------------------
+2.5 [HIGH] A Pokemon could be deleted by a full party and a full PC
+--------------------------------------------------------------------------------
+    if (!getParty(to).add(pokemon)) getPC(to).add(pokemon);
+
+The second return value was never checked, and the Pokemon had already been
+removed from its source store. Party full and PC full meant both adds returned
+false and the Pokemon existed nowhere - while the history still recorded the
+trade as completed.
+
+FIXED - both add() and remove() return values are checked, and the move happens
+in two phases: taken from both sides first, delivered to both sides after. A
+failed delivery returns the Pokemon to its sender and tells the staff.
+
+
+--------------------------------------------------------------------------------
+2.6 [HIGH] A refund after a cancel was never verified
+--------------------------------------------------------------------------------
+    MoneyService.transfer(payee, payer, amount);
+
+The CompletableFuture was discarded, and the next line logged "returned to" as
+though it had happened. transfer() returns false without throwing in three
+documented cases: no economy, account not resolvable, balance no longer
+sufficient. The payer could end up with no money, no items, and a log line
+claiming they had been refunded.
+
+FIXED - refund() checks the boolean, retries once, and on failure logs an ERROR
+and sends chat.staff.refund_failed. See also 5.2, which found that the retry
+itself could silently never run.
+
+
+--------------------------------------------------------------------------------
+2.7 [HIGH] Static executors were never recreated after a server stop
+--------------------------------------------------------------------------------
+The database workers were `static final` and closed at SERVER_STOPPED, while
+onInitialize runs once per JVM. Opening a second world in the same JVM -
+singleplayer, LAN, a world reopened without quitting - hit a closed executor and
+threw RejectedExecutionException synchronously out of the startup callback. The
+recovery listener list also accumulated one entry per start, so the replay ran N
+times.
+
+FIXED - the workers are volatile and non-final, recreated in open(); ReadOnlyDb
+has a reopen(). The listener list is cleared on close.
+
+
+--------------------------------------------------------------------------------
+2.8 [HIGH] The blacklist emptied itself silently on failover
+--------------------------------------------------------------------------------
+Two defects, one cause. (a) The cache was reloaded from whatever backend was
+active: on SQLite, which had never received the rules written to MariaDB, the
+read returned an empty list and the cache was overwritten with it. Everything
+blacklisted became tradeable again, with no warning, and the second check at
+commit used the same empty cache. (b) Revocations are UPDATEs, and the replay
+queue only knows how to copy INSERTs, so a revocation written in fallback never
+reached MariaDB.
+
+FIXED - (a) a reload does not overwrite a non-empty cache while the database is
+degraded. (b) revocation is refused outright while degraded, and the
+administrator is told to try again, rather than being told it worked.
+
+
+--------------------------------------------------------------------------------
+2.9 [MEDIUM] The eight-slot limit was checked before an asynchronous write
+--------------------------------------------------------------------------------
+The offer entry was only added when the escrow write came back from another
+thread, but the limit was read from the current list size. sgui delivers every
+click of the same tick, and a drag produces one per slot crossed, so several
+clicks could all read the old size. Entries past the eighth were invisible in
+the grid, could not be removed by clicking, and still counted against the
+recipient's inventory capacity.
+
+FIXED - the slot is reserved on the server thread before the asynchronous write
+(Side.pending), and the fullness check counts entries plus reservations.
+
+
+--------------------------------------------------------------------------------
+2.10 [MEDIUM] Escrow was resolved after the items had already been handed over
+--------------------------------------------------------------------------------
+The items were delivered in memory and only then was the resolve queued. If the
+process died in between, the rows stayed HELD and the login scan gave them back
+to the original owner while the recipient already had them in their save file.
+
+FIXED - the close comes first and the delivery second, and only what the close
+actually claimed is delivered. Round 3 then extended the same ordering to every
+cancel path (6.1) and removed the synchronous wait it had introduced (6.18).
+
+
+--------------------------------------------------------------------------------
+2.11 [MEDIUM] A retry re-ran non-transactional work
+--------------------------------------------------------------------------------
+On the first SQLException the whole unit of work was re-executed on the new
+connection. Only the history write was transactional; escrow holds, blacklist
+writes and API key issuance ran in autocommit across several statements. For an
+escrow hold the ULID was computed outside the lambda, so the retry re-inserted
+the same primary key, failed on the duplicate, and the caller returned the item
+to the player - while the HELD row really existed. The next login returned it a
+second time.
+
+FIXED - every unit of work is wrapped in a transaction with commit/rollback, so a
+retry starts from a clean state.
+
+
+--------------------------------------------------------------------------------
+2.12 [MEDIUM] Inventory capacity stopped being watched during the countdown
+--------------------------------------------------------------------------------
+The capacity watch only ran while the offer was still open. During the three
+second cancel window space could disappear, and commit re-checked the Pokemon,
+the blacklist and the balance - but not the room. Items then fell on the floor in
+front of whoever was standing there, or, combined with 2.4, were destroyed.
+
+FIXED - commit re-checks both inventories and cancels with a dedicated reason
+(INVENTORY_FULL) rather than dropping anything.
+
+
+--------------------------------------------------------------------------------
+2.13 [MEDIUM] A session stuck in COMMITTING never closed
+--------------------------------------------------------------------------------
+The stage was set before the payment was requested and only cleared inside the
+payment callback. There was no timeout and no watchdog: if the callback never
+came, the two players were "already in another trade" until the server restarted,
+and /bt cancel could not free them either. The session also held two screens,
+which held two player entities, which held the world.
+
+FIXED - a 20 second limit on the economy operation, plus a watchdog on the
+session itself. The watchdog's limit is derived from the economy's limit rather
+than picked separately (see 5.8), so the two cannot drift apart.
+
+
+--------------------------------------------------------------------------------
+2.14 [MEDIUM] An exception during delivery left the session half-open
+--------------------------------------------------------------------------------
+The stage was set to CLOSED early, but the session was only removed from the
+registry at the end. A RuntimeException in between - from Cobblemon, from the
+item codec - skipped the removal: both players were permanently stuck, the guard
+made cancel() a no-op, and the exception broke the whole server tick.
+
+FIXED - a try/finally around the state-mutating part guarantees removal, and each
+session ticks inside its own try so one bad trade cannot break the server tick.
+
+
+--------------------------------------------------------------------------------
+2.15 [MEDIUM] Double-clicking confirm cancelled the trade you had just confirmed
+--------------------------------------------------------------------------------
+One button, two meanings, switching the instant the countdown opened. A human
+double click takes one or two ticks, so the second click read the new meaning and
+cancelled - and the message blamed the player for it.
+
+FIXED - five grace ticks after the window opens, during which the button ignores
+clicks. That still leaves 55 ticks to cancel on purpose.
+
+
+--------------------------------------------------------------------------------
+2.16 [MEDIUM] Text columns too narrow on MariaDB
+--------------------------------------------------------------------------------
+Nicknames have no server-side length limit and can carry formatting. On MariaDB
+with STRICT_TRANS_TABLES (the default since 10.2) an oversized value is not
+truncated, it fails the INSERT - and that INSERT is the history of a trade that
+has already happened. The trade stood, the record of it did not.
+
+FIXED - db/Columns.java holds the widths and a truncate() that respects surrogate
+pairs (cutting an emoji in half leaves a character the driver rejects), applied to
+every text field on the way in. The schema was widened where widening was the
+right answer.
+
+
+--------------------------------------------------------------------------------
+2.17 [MEDIUM] Shutdown did not wait for the write queue
+--------------------------------------------------------------------------------
+The worker threads were daemons and nothing waited for them, so a quick JVM exit
+took the queued writes with it: the history of the last trades, and the resolves
+of escrow cancelled by the mass disconnect. Those lost resolves are the
+duplication path of 2.10 all over again.
+
+FIXED - a 10 second awaitTermination on both stores, with an ERROR if it expires.
+Shutdown is slower on purpose.
+
+
+--------------------------------------------------------------------------------
+2.18 [LOW] Nobody looked at how many rows an escrow resolve updated
+--------------------------------------------------------------------------------
+`WHERE id = ? AND state = 'HELD'` means a missing row, an already-resolved row or
+a row on the other backend all produce zero updates and no signal. It is the
+reason the divergence in 2.2 and 2.3 was completely silent.
+
+FIXED - the rowcount is read, and a zero logs an ERROR naming the row. Round 3
+went further and made that rowcount the lock that decides whether anything is
+delivered at all (6.3).
+
+
+--------------------------------------------------------------------------------
+2.19 [LOW] The replay dropped entries of an unknown kind
+--------------------------------------------------------------------------------
+An unrecognised entry logged a warning and then fell through to the line that
+removed it from the queue, and counted it as transferred.
+
+FIXED - an unknown kind is left in the queue and not counted.
+
+
+--------------------------------------------------------------------------------
+2.20 [LOW] The money history recorded intentions, not transfers
+--------------------------------------------------------------------------------
+Both gross offers were written, while what actually moves is the difference
+between them, in one transaction. Anyone reconstructing a dispute from those rows
+- which is what the table is for - computed a balance change that never happened.
+The currency column also stored a config value that selects nothing.
+
+FIXED - a new column, trade_money.transferred, holds the real delta on the
+balance (negative for the payer), and the currency label is always the provider's
+primary currency, which is what is really used.
+
+
+--------------------------------------------------------------------------------
+2.21 [INFO] Italian was advertised and not shipped
+--------------------------------------------------------------------------------
+The README and the changelog promised English and Italian; the jar contained
+en_us only, so setting Italian silently gave you English.
+
+FIXED - it_it.json is complete and shipped, with key and placeholder parity
+against en_us verified.
+
+
+================================================================================
+PART 3 - HYPOTHESES CHECKED AND DISCARDED
+================================================================================
+Listed because otherwise the sections above look like everything that was
+examined, and because re-opening them without the evidence costs time.
+
+  * Duplication by clicking your own inventory while the trade screen is open -
+    DISCARDED. sgui always cancels vanilla slot handling for its screens, so the
+    manual removal never doubles up with a vanilla one. Read in the sgui sources.
+
+  * Inserting items into the screen's fake slots - DISCARDED. Those slots refuse
+    both insertion and extraction.
+
+  * Long overflow when computing the net money - DISCARDED. Negative amounts are
+    refused on both entry paths, so the difference always fits.
+
+  * The same Pokemon offered twice in one offer - DISCARDED, deduplicated by UUID.
+
+  * Deadlock between the recovery listener and the database worker - DISCARDED.
+    The listener submits to the worker, it does not join it.
+
+  * A partial config file zeroing nested defaults - DISCARDED. Gson uses the
+    no-arg constructor, so field initialisers run and absent keys keep their
+    defaults.
+
+  * A time-of-check/time-of-use gap between reading the balance and transferring
+    - DISCARDED as a finding of its own. The transfer re-checks and delegates to
+    the provider's atomic operation; the real problem was the unverified refund,
+    which is 2.6.
+
+  * The mixin not applying - DISCARDED. The target descriptor exists in
+    Cobblemon 1.7.3+1.21.1, verified with javap.
+
+  * Item duplication through sgui's click path - DISCARDED again in round 3, with
+    the inventory index mapping checked as well.
+
+
+================================================================================
+PART 4 - REGRESSIONS CAUSED BY OUR OWN FIXES
+================================================================================
+Four defects were introduced by the fixes themselves and caught by re-reading the
+diffs before shipping. They are listed because they are exactly the kind of thing
+the original audit would have flagged as CRITICAL.
+
+R1  Moving one side at a time meant the side served first still had the slots of
+    the Pokemon it was giving away occupied: a one-for-one trade with a full party
+    failed halfway. Closed by separating "take from both" from "give to both".
+
+R2  Wrapping the replay in a transaction let an entry leave the SQLite queue
+    before its copy was committed on MariaDB: a rollback at the end would have
+    lost every entry without transferring any. Closed by committing on the target
+    before forgetting on the source.
+
+R3  The new watchdog could close a session while the payment was still in flight,
+    and the late callback would then deliver the items a second time. Closed with
+    a guard on the stage, which refunds instead when the payment did succeed.
+
+R4  Pokemon delivery could throw before the items - already marked CONSUMED, and
+    therefore unrecoverable - had been handed over. Closed by moving items first
+    and isolating the Pokemon move behind a finally that delivers whatever has
+    already left a store.
+
+
+================================================================================
+PART 5 - ROUND 2: 12 FINDINGS ON THE CORRECTED CODE
+================================================================================
+
+This round only looked at what round 1 had left open, and at the code that had
+closed round 1's findings.
+
+
+--------------------------------------------------------------------------------
+5.1 [HIGH] A refusal fell back to Cobblemon's own trade
+--------------------------------------------------------------------------------
+The mixin cancelled the native trade only when BetterTrades had successfully
+opened a session. It returns nothing in three cases - database or escrow
+unusable, one of the players already trading, resource pack missing - and in all
+three Cobblemon's own trade went ahead instead.
+
+That is a complete bypass: no blacklist, no history, no escrow, no tradeable-flag
+check, no API events, no trace. The easiest way to trigger it was to refuse the
+server's resource pack.
+
+FIXED - the mixin always cancels, before even trying to open a session. A refusal
+from BetterTrades now means "no trade", not "a trade outside the mod". Opening is
+wrapped in a try/catch so an error there cannot travel back into packet handling.
+
+
+--------------------------------------------------------------------------------
+5.2 [HIGH] A timeout could make the refund never run at all
+--------------------------------------------------------------------------------
+Every money operation runs on a single-threaded executor, and the only protection
+was orTimeout() on the future. orTimeout interrupts nothing: it completes the
+future and leaves the task queued. When the worker finally reaches a task whose
+future is already complete, CompletableFuture skips the supplier entirely - the
+body never runs and nothing says so. Verified with a standalone harness.
+
+A refund is exactly such a queued transfer. Behind one slow Impactor call, the
+payer had paid, the log said "refunded", and the refund had never started.
+
+FIXED - the body is queued as a task of its own and the timeout lives on a copy of
+the future, so the body always runs. MoneyService.Operation now exposes both
+awaited() - which expires, for callers who cannot hang - and settled(), which
+carries the real outcome however late it arrives. A refund is only retried on a
+genuine false; a timeout is recorded as an unknown outcome
+(chat.staff.refund_unknown), and a payment given up for lost that later lands is
+refunded rather than left with the payer.
+
+KNOWN LIMIT, deliberately kept: the worker is still single-threaded, because
+nothing about Impactor's thread safety should be assumed. While Impactor is
+blocked, money trades are slow for everyone.
+
+
+--------------------------------------------------------------------------------
+5.3 [HIGH] Escrow from a previous version could be stranded forever
+--------------------------------------------------------------------------------
+The one-off migration that moves old escrow rows into the new local file only ran
+when the active backend was MariaDB. A server that had always run on SQLite -
+which is the default configuration - never ran it at all: its HELD rows stayed in
+a file nothing queries any more, with the items already out of the players'
+inventories. Permanent loss, reproduced.
+
+FIXED - the condition now describes where the data comes from, not which backend
+is preferred, and the "done" marker is per backend, so a server that started in
+fallback migrates SQLite now and MariaDB when it recovers. Covered by a test.
+
+
+--------------------------------------------------------------------------------
+5.4 [MEDIUM] The delivery guard did not cover the preparation
+--------------------------------------------------------------------------------
+The try/finally added for 2.14 started after the summary and the item collection,
+both of which call Cobblemon and the item codec and can throw. An exception there
+left the session CLOSED and still registered: both players stuck, /bt cancel
+unable to free them, and the error swallowed by Minecraft's generic task logger.
+
+FIXED - the try opens immediately after the stage changes, so the finally covers
+the whole method, and the catch logs with the trade id.
+
+
+--------------------------------------------------------------------------------
+5.5 [MEDIUM] A blacklist rule added during a failover did nothing
+--------------------------------------------------------------------------------
+The protection from 2.8 - do not overwrite the cache while degraded - also threw
+away the rule that had just been written. The administrator got a confirmation
+and the rule blocked nothing until MariaDB came back.
+
+FIXED - a freshly written rule is put into the cache before the reload, so the
+degraded branch keeps it and the normal branch finds it again anyway.
+
+
+--------------------------------------------------------------------------------
+5.6 [MEDIUM] Automatic recovery leaked the SQLite connection
+--------------------------------------------------------------------------------
+The field was replaced without closing the previous connection on the automatic
+comeback path. One SQLite connection and its file handle leaked per failover
+cycle, and with WAL journalling that file was no longer checkpointed.
+
+FIXED - the close moved to where the field is replaced, and happens only after
+the new connection is up, so a failed connect does not take away a working one.
+
+
+--------------------------------------------------------------------------------
+5.7 [MEDIUM] The read-only API leaked a connection on every expiry
+--------------------------------------------------------------------------------
+An invalid connection was replaced without being closed. Since that connection is
+only used when another mod queries the API, expiry is the ordinary case.
+
+FIXED - closed before reopening.
+
+
+--------------------------------------------------------------------------------
+5.8 [MEDIUM] The watchdog expired before the economy did
+--------------------------------------------------------------------------------
+Ten seconds against the economy's twenty meant the "payment came back to a closed
+session" branch was not the rare case but the normal one for any slow payment:
+items already returned, money still in flight.
+
+FIXED - the watchdog's limit is derived from the economy's, so it is always the
+last net rather than the first. The cancellation message also names whoever was
+actually paying, instead of always naming the left-hand player.
+
+
+--------------------------------------------------------------------------------
+5.9 [LOW] A reserved slot could stay reserved forever
+--------------------------------------------------------------------------------
+The reservation from 2.9 was only released inside the escrow callback. A write
+that never completed left the counter high and the player reading "offer full"
+with fewer than eight entries on the grid.
+
+FIXED - the release has its own five second limit, on a copy of the future so the
+write itself still runs, and the callback refuses the entry if the places really
+have run out by then.
+
+
+--------------------------------------------------------------------------------
+5.10 [LOW] An undecodable escrow row retried at every login, forever
+--------------------------------------------------------------------------------
+A payload that cannot be read back - a removed mod, a component that no longer
+exists - threw, was caught, and left the row HELD. The same attempt repeated on
+every login, for ever, with no terminal state.
+
+FIXED - a new terminal state, UNREADABLE. The row leaves the login queue and the
+staff is told. The item is still lost: there is nothing to rebuild it from.
+
+
+--------------------------------------------------------------------------------
+5.11 [LOW] A repeated aspect made the blacklist command fail
+--------------------------------------------------------------------------------
+`Set.of` throws on duplicates, and the argument is hand-typed: "shiny shiny"
+ended the command with Brigadier's generic error and no explanation.
+
+FIXED - Set.copyOf, which collapses duplicates, and an empty string now yields an
+empty set rather than a set holding one empty aspect.
+
+
+--------------------------------------------------------------------------------
+5.12 [LOW] A closed executor destroyed the offered item
+--------------------------------------------------------------------------------
+supplyAsync propagates RejectedExecutionException synchronously, so it never
+reached the future's error branch - the branch that gives the item back. The
+stack had already left the inventory.
+
+FIXED - a submit() wrapper turns the rejection into a failed future in all three
+stores, and the offer path also catches what the encoder can throw before the
+future even exists. Either way the item goes back into the inventory.
+
+
+================================================================================
+PART 6 - ROUND 3: 23 FINDINGS
+================================================================================
+
+This round read the corrected code end to end and concentrated on the two areas
+the previous rounds had touched least: the cancel paths, and everything
+BetterTrades had quietly taken over from Cobblemon.
+
+
+--------------------------------------------------------------------------------
+6.1 [MEDIUM] Cancel paths returned items before closing escrow
+--------------------------------------------------------------------------------
+The commit path waited for the close before moving anything, and a comment
+explained exactly why. Every cancel path did the opposite: the item went back
+into the inventory synchronously while the state change was queued. A crash in
+between left the row HELD, and the next login delivered a second copy.
+
+FIXED - the ordering was inverted on ALL paths: close first, deliver second, and
+deliver only what the close actually claimed. The opposite window remains - row
+closed, delivery not yet made - which is the trade the commit path had already
+accepted: better a lost item than a duplicated one.
+
+
+--------------------------------------------------------------------------------
+6.2 [MEDIUM] The outcome of an escrow close was discarded
+--------------------------------------------------------------------------------
+Five callers ignored the future returned by the resolve. A failure inside it -
+after one retry - threw into a future nobody was watching. The player already had
+the item and the row was still HELD, with no log line saying the close had failed.
+
+FIXED - the future is consumed; on failure nothing is delivered, an ERROR names
+the number of rows, and the staff is notified. The rows are still HELD, so they
+come back at the next login.
+
+
+--------------------------------------------------------------------------------
+6.3 [MEDIUM] Reconnecting while a disconnect-cancel was queued duplicated items
+--------------------------------------------------------------------------------
+A disconnect queues its cancel on the server thread; a login returns open escrow
+immediately. Reconnect fast enough and both paths read the same HELD rows and
+both delivered. The `state = 'HELD'` guard protected the database row, not the
+delivery.
+
+Starting quantity N, final quantity 2N.
+
+FIXED - the UPDATE's rowcount became the lock for the delivery too. The claim runs
+one executeUpdate per row - not a batch, because executeBatch may answer
+SUCCESS_NO_INFO - and returns only the ids that really moved out of HELD. Both
+paths may run; only one claims, and only the claimant delivers. Covered by a test.
+
+
+--------------------------------------------------------------------------------
+6.4 [HIGH] Items delivered to a removed player, and escrow closed anyway
+--------------------------------------------------------------------------------
+Two paths captured the player object and used it inside an asynchronous callback
+without re-resolving it. A player who disconnected in between got items written
+into an inventory that would never be saved again - the save happens before the
+removal - and the escrow was then marked resolved. The item existed nowhere, and
+the log said it had been returned.
+
+FIXED - the player is resolved from the player manager at delivery time and
+checked for removal. Nothing delivered means nothing resolved: the rows stay HELD
+and come back at the next login, with a WARN saying how many. On the one path
+where no escrow row exists at all, an ERROR names the item and the staff is told -
+still unrecoverable, but no longer silent.
+
+KNOWN LIMIT: a theoretical window remains between the save and the removal from
+the player list. The check narrows it; it does not eliminate it.
+
+
+--------------------------------------------------------------------------------
+6.5 [HIGH] Cobblemon's trade events stopped firing, so other mods' vetoes were bypassed
+--------------------------------------------------------------------------------
+Because the mixin always cancels, performTrade is never reached - and performTrade
+is where Cobblemon fires TRADE_EVENT_PRE and TRADE_EVENT_POST. TRADE_EVENT_PRE is
+the standard way for another mod, or a server configuration, to forbid a trade.
+Installing BetterTrades silently switched all of that off, and took Cobblemon's
+trade advancement with it.
+
+FIXED - a new class fires TRADE_EVENT_PRE in commit(), before anything moves, and
+TRADE_EVENT_POST once delivery is done, on the Pokemon really delivered. A veto
+cancels the trade with a dedicated message. Cobblemon's event only knows
+one-for-one trades, so pairs are formed by position with the shorter side
+wrapping.
+
+KNOWN LIMIT, deliberate: if one side offers no Pokemon at all - Pokemon against
+items or money only - there is no pair and no event, because the alternative
+would be inventing a second Pokemon and presenting it to listeners as traded.
+
+
+--------------------------------------------------------------------------------
+6.6 [HIGH] Trade evolutions stopped happening server-wide
+--------------------------------------------------------------------------------
+Same cause: the move was reimplemented, the logic Cobblemon ran straight after it
+was not. An entire game mechanic - and for many players the whole reason to trade
+- quietly stopped working, with no error anywhere.
+
+FIXED - the evolution step runs after delivery, on the Pokemon that really
+arrived, copying performTrade's logic: only TradeEvolutions among the locked
+evolutions, the list copied before iterating, stopping at the first that fires, in
+both directions. An exception here is caught and logged, because by then the items
+have moved and the history must not be lost.
+
+
+--------------------------------------------------------------------------------
+6.7 [MEDIUM] Friendship was not reset after a trade
+--------------------------------------------------------------------------------
+Cobblemon resets a traded Pokemon's friendship to its form's base value.
+BetterTrades handed it over as it was, which opened a service the native path does
+not offer: max out friendship, trade, and the recipient holds a Pokemon ready for
+a friendship evolution.
+
+FIXED - the reset runs on the delivered Pokemon, with the value and the semantics
+taken from performTrade's bytecode.
+
+
+--------------------------------------------------------------------------------
+6.8 [MEDIUM] Spamming the money button could stall everyone else's economy
+--------------------------------------------------------------------------------
+Every click queued a balance read on the single economy worker, with no cooldown
+and no deduplication. Since the waiting timeout starts when the operation is
+created rather than when it runs, another player's payment could expire before it
+even began, cancelling their trade for MONEY. One player could break other
+people's money trades without touching them.
+
+FIXED - the money screen holds a "reading" flag: while a balance read is in
+flight, further clicks queue nothing.
+
+
+--------------------------------------------------------------------------------
+6.9 [MEDIUM] Sessions and listeners were never cleared at shutdown
+--------------------------------------------------------------------------------
+The session map and the API listener lists are static and live as long as the JVM.
+Nothing cleared them at SERVER_STOPPED, so in the next world the players of every
+open session were "already in another trade" forever, the map held the previous
+server's worlds and entities, and a mod registering its listeners on every start
+had them fire twice.
+
+FIXED - shutdown cancels open sessions, clears the map and clears the listeners,
+before the databases close. Since the players are already gone at that point,
+their escrow stays HELD and comes back at the first login of the next world.
+
+CONTRACT NOTE FOR INTEGRATORS: register pre/post listeners on every server start,
+not once at mod initialisation.
+
+
+--------------------------------------------------------------------------------
+6.10 [MEDIUM] A revoked API key came back to life
+--------------------------------------------------------------------------------
+API key revocation did in fallback exactly what blacklist revocation refuses to do
+for the same reason: write an UPDATE that the replay cannot carry. On recovery the
+real table still had revoked_at NULL, and the key went back into the cache. Access
+that had been taken away was restored, with nobody watching.
+
+FIXED - revocation is refused while degraded, with the same guard as the blacklist.
+
+
+--------------------------------------------------------------------------------
+6.11 [MEDIUM] No version bound on Cobblemon, with a mandatory mixin
+--------------------------------------------------------------------------------
+The mod's only hook is an injection into a protected method of a Cobblemon
+internal class, the injection is mandatory, and the dependency accepted any
+Cobblemon version. A refactor upstream would not degrade anything - it would stop
+the server from starting, with an error about a mixin rather than about versions.
+
+FIXED - the dependency is now >=1.7.3 <1.8.0. Fabric refuses to load the mod with
+a message about versions; inside the declared range a missing target is still a
+hard failure, which is what you want to see immediately.
+
+
+--------------------------------------------------------------------------------
+6.12 [LOW] The countdown could start on a confirmation that had already dropped
+--------------------------------------------------------------------------------
+The balance read validated only the balance. During the up-to-20-seconds it could
+take, the periodic check might have dropped a confirmation because an inventory
+filled up - and the countdown started anyway, only to fail at commit for a reason
+that did not match what was on screen.
+
+FIXED - the callback re-reads the conditions that started it, not only the one it
+was verifying.
+
+
+--------------------------------------------------------------------------------
+6.13 [LOW] Forgetting a session could free the wrong one
+--------------------------------------------------------------------------------
+The removal was by player id, without checking which session was mapped. An old
+session closing late could free the UUIDs of a new one, leaving that new session
+alive with both screens open but outside the registry: no ticks, no countdown, no
+distance checks, and /bt cancel answering that they were not trading.
+
+FIXED - only mappings pointing at that exact session are removed.
+
+
+--------------------------------------------------------------------------------
+6.14 [LOW] With an empty party, no trade could be opened at all
+--------------------------------------------------------------------------------
+Cobblemon refuses the request before onAccept when a party is empty, a check
+written when Pokemon were the only tradeable thing. Two advertised features -
+item-only and money-only trades - were unreachable for anyone keeping everything
+in the PC or just starting out, and the refusal came from Cobblemon, so it never
+mentioned BetterTrades.
+
+FIXED - a second injection makes that check answer yes. Who may open a trade is
+decided by BetterTrades, which has its own checks.
+
+
+--------------------------------------------------------------------------------
+6.15 [LOW] A failed screen open left both players marked as trading
+--------------------------------------------------------------------------------
+The session was registered before the screens were built. If building threw, the
+two players were "already in another trade" in front of nothing.
+
+FIXED - the screen opening is inside a try; on failure the session is removed and
+both players are free to retry.
+
+
+--------------------------------------------------------------------------------
+6.16 [LOW] Re-issuing an API key in fallback failed on a duplicate queue key
+--------------------------------------------------------------------------------
+The replay queue's primary key is (kind, entity_id), and for API clients the
+entity_id is the mod id - a natural key that repeats. The second insert violated
+the primary key and took the whole key issuance down with it, with a generic
+error that never mentioned the queue.
+
+FIXED - the queue insert ignores duplicates. The replay reads the current state of
+the real row anyway.
+
+
+--------------------------------------------------------------------------------
+6.17 [LOW] Values written to VARCHAR columns without truncation
+--------------------------------------------------------------------------------
+The truncation helper was applied on the history path but not on the blacklist and
+API key paths, where hand-typed identifiers and unbounded reasons arrive. On
+MariaDB those INSERTs were rejected; on SQLite the same command worked - exactly
+the backend-dependent behaviour the helper exists to prevent.
+
+FIXED - truncation applied on every write path, with the same width on both sides
+of a revocation so it still finds its row. As a bonus, the blacklist command now
+validates item identifiers instead of creating a rule that could never match.
+
+
+--------------------------------------------------------------------------------
+6.18 [LOW] Closing escrow blocked the server thread for up to two seconds
+--------------------------------------------------------------------------------
+The guarantee introduced for 2.10 was implemented as a synchronous wait on the
+server thread: up to two seconds of frozen server per trade, and at the deadline
+it delivered anyway - paying the cost without getting the guarantee.
+
+FIXED - the wait is gone. Escrow closes on its own thread and delivery happens in
+a follow-up server task, so the server thread never waits on the disk. The
+guarantee is stronger than before: without a successful close, nothing is
+delivered at all.
+
+KNOWN LIMIT, stated: delivery now happens one tick after the close. A process
+death in that tick leaves the rows CONSUMED without delivery - an item lost, not
+duplicated. Same window as before, turned the same way round.
+
+
+--------------------------------------------------------------------------------
+6.19 [LOW] /bt cancel said "done" when it had only queued a cancel
+--------------------------------------------------------------------------------
+On a session in COMMITTING the cancel is merely recorded, but the command replied
+as if it had worked, sending the administrator to look elsewhere for two players
+who were still in a trade.
+
+FIXED - cancel() returns a boolean, and the command answers "queued" with a
+non-zero exit code in that case.
+
+
+--------------------------------------------------------------------------------
+6.20 [INFO] Schema columns nothing ever wrote
+--------------------------------------------------------------------------------
+A player-name history table existed and no INSERT ever named it, so a nickname
+change rewrote the past: the API resolves participants by UUID and shows the
+current name. A Pokemon capture-date column was written as a constant NULL.
+
+FIXED, two different ways. The name history is now written, once per name, using
+the unique constraint to stay idempotent - so from here on the name of the day is
+recoverable. Names changed before this version were never recorded and cannot be
+recovered. The capture-date column was removed instead: Cobblemon 1.7.3 exposes no
+such date, so it was not a column waiting to be filled, it was a column with no
+source.
+
+
+--------------------------------------------------------------------------------
+6.21 [INFO] The schema version was written and never read
+--------------------------------------------------------------------------------
+Harmless at version 1, and a trap for the first schema change: CREATE TABLE IF NOT
+EXISTS does not add columns to an existing table, so an old database would have
+opened silently and failed at the first INSERT naming a new column - once per
+trade, with an error saying nothing about versions.
+
+FIXED - the stored version is read before the schema is applied, and a mismatch
+throws instead of continuing. Callers treat that as "database unavailable", which
+is loud and reversible. Covered by a test that also checks the message names the
+version it found.
+
+
+--------------------------------------------------------------------------------
+6.22 [INFO] A balance above Long.MAX_VALUE wrapped around
+--------------------------------------------------------------------------------
+BigDecimal.longValue() does not throw on overflow, it returns the low 64 bits, so
+a huge balance could read as any number, including a negative one. The transfer
+itself compares in BigDecimal and was never affected - no money could be created
+or lost - but the upstream checks could refuse a valid offer while displaying
+nonsense.
+
+FIXED - the conversion saturates instead of truncating, with a WARN. Saturation is
+the right answer for a comparison: whoever has more than Long.MAX_VALUE has enough
+for any offer.
+
+
+--------------------------------------------------------------------------------
+6.23 [INFO] Two independent distance limits, one of them not ours
+--------------------------------------------------------------------------------
+Opening a trade goes through Cobblemon and its own tradeMaxDistance; the open
+session is watched by BetterTrades' trade.maxDistance. Either the excess does
+nothing, or the trade opens and is cancelled immediately - and in both cases the
+administrator changes the documented value and sees no effect.
+
+FIXED as a warning, not as a constraint: the two numbers stay two, because
+Cobblemon's is not ours to overwrite. At startup the two are compared and, when
+they disagree, a WARN says which of the two situations you are in.
+
+
+================================================================================
+PART 7 - WHAT IS STILL NOT VERIFIED
+================================================================================
+
+This is the honest boundary of the work. None of the following is a known
+defect; all of it is something nobody has watched happen.
+
+  * No two-player play session. Everything that needs two connected clients -
+    offering, confirming, the countdown, commit, delivery, the Pokemon move - was
+    reasoned about on the code and on the dependencies' bytecode, not observed.
+    The server was started with the mod and came up clean; no client ever
+    connected to it.
+
+  * No debugger session on a live trade. The static inspections were run from the
+    IDE, but attaching to a running trade needs two accounts.
+
+  * Impactor was absent from the test environment for most of the work. The money
+    paths were exercised against the real API signatures (checked with javap) and
+    one finding was reproduced A/B on the real MoneyService, but a live economy
+    under load has not been observed.
+
+  * MariaDB was absent. The failover, the replay and everything about remote
+    column widths are reasoned from the code and from the driver's behaviour, not
+    run against a real MariaDB. The SQLite side is exercised by the tests.
+
+  * No heap profiling. The two retention findings were closed by reading the
+    reference chains; no growth was ever measured. The two connection leaks were
+    demonstrated on the code, not with a profiler.
+
+  * Shutdown timing was never measured. Closing the two stores can now take up to
+    10 seconds each, 20 in the worst case. That is a deliberate trade against
+    losing queued writes, but nobody has timed it on a busy server.
+
+  * Mixin compatibility outside Cobblemon 1.7.3 was not tested. The dependency
+    range now refuses anything else, which turns an unknown into a clear refusal.
+
+  * The Italian strings have not been seen rendered in the custom font. The font
+    coverage was checked statically - the accented characters exist in the
+    providers and the width table covers them - and the five keys that go through
+    the custom font are plain ASCII in Italian. Coverage is verified; the
+    rendering is not.
+
+  * The unit tests cover SQL and pure logic: the schema, escrow state
+    transitions, the migration, column truncation. 15 tests. They do not cover the
+    Minecraft path, which is the part that needs a server and two players.
+
+If you run BetterTrades on a production server and find something this audit
+missed, tell us: https://discord.gg/pQPWr7vfHu. A reproduction with item counts
+before and after is worth more than any amount of further reading.
+
+================================================================================
+End of report. Studio Deriva.
+================================================================================

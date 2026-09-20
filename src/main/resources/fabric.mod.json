@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "bettertrades",
+  "version": "${version}",
+  "name": "BetterTrades",
+  "description": "Server-side Cobblemon player trading: a custom trade screen, item and money support, and every completed trade stored in a normalised database with a read-only API for other mods.",
+  "authors": [
+    "Studio Deriva"
+  ],
+  "contact": {
+    "discord": "https://discord.gg/pQPWr7vfHu"
+  },
+  "license": "MIT",
+  "icon": "assets/bettertrades/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.bettertrades.BetterTrades"
+    ]
+  },
+  "mixins": [
+    "bettertrades.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.5",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*",
+    "sgui": "*",
+    "polymer-core": "*",
+    "cobblemon": ">=1.7.3 <1.8.0",
+    "polymer-resource-pack": "*"
+  },
+  "suggests": {
+    "luckperms": "*",
+    "impactor": "*"
+  },
+  "custom": {
+    "polymer:resource_pack_include": true
+  }
+}
