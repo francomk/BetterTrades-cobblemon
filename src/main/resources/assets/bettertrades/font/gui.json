@@ -37,6 +37,24 @@
       ]
     },
     {
+      "type": "bitmap",
+      "file": "bettertrades:gui/money_panel.png",
+      "height": 102,
+      "ascent": 13,
+      "chars": [
+        ""
+      ]
+    },
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/money_input.png",
+      "height": 80,
+      "ascent": 16,
+      "chars": [
+        ""
+      ]
+    },
+    {
       "type": "space",
       "advances": {
         "‌": 0,

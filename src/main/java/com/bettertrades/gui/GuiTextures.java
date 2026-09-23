@@ -35,8 +35,9 @@ import java.util.Map;
  *       top of the artwork rather than under it.</li>
  * </ul>
  *
- * Coordinates in this class are pixels from the title's own origin, so 0 is {@code x + 8}.
- * {@link #from(int, int)} converts a coordinate measured on the texture instead.
+ * Callers give x coordinates measured on the vanilla screen texture; the composer turns them
+ * into pixels from the title's own origin, which is {@code x + 8} on a chest screen and
+ * {@code x + 60} on an anvil.
  */
 public final class GuiTextures {
 
@@ -51,14 +52,19 @@ public final class GuiTextures {
     private static final int HEAD_ADVANCE = 25;
     private static final char WARNING = '';
     private static final int WARNING_ADVANCE = 80;
+    private static final char MONEY_PANEL = '';
+    private static final int MONEY_PANEL_ADVANCE = 80;
+    private static final char MONEY_INPUT = '';
+    private static final int MONEY_INPUT_ADVANCE = 136;
 
     /** Spacing characters: 2^n to the right from E100, 2^n to the left from E120. */
     private static final char SPACE_RIGHT = '';
     private static final char SPACE_LEFT = '';
     private static final int SPACE_POWERS = 11;
 
-    /** The title sits 8px right of the texture's left edge and 18px below its top edge. */
-    private static final int TEXTURE_X = -8;
+    /** Where the client draws the title, in pixels from the screen texture's left edge. */
+    private static final int CHEST_TITLE_X = 8;
+    private static final int ANVIL_TITLE_X = 60;
 
     private static final Style PLAIN = Style.EMPTY
             .withItalic(false)
@@ -68,13 +74,14 @@ public final class GuiTextures {
 
     private GuiTextures() {}
 
-    /** Turns an x measured on the mockup into the pen coordinate this class uses. */
-    public static int from(int textureX) {
-        return textureX + TEXTURE_X;
+    /** A title for a chest screen, the trade screen's GENERIC_9X6. */
+    public static Composer composer() {
+        return new Composer(CHEST_TITLE_X);
     }
 
-    public static Composer composer() {
-        return new Composer();
+    /** A title for an anvil screen, which draws its title further right. */
+    public static Composer anvilComposer() {
+        return new Composer(ANVIL_TITLE_X);
     }
 
     /**
@@ -102,9 +109,17 @@ public final class GuiTextures {
     public static final class Composer {
 
         private final MutableText out = Text.empty();
+        private final int titleX;
         private int pen;
 
-        private Composer() {}
+        private Composer(int titleX) {
+            this.titleX = titleX;
+        }
+
+        /** Turns an x measured on the screen texture into the pen coordinate. */
+        private int from(int textureX) {
+            return textureX - titleX;
+        }
 
         /** Moves the pen without drawing, by spending powers of two of blank space. */
         public Composer move(int to) {
@@ -137,6 +152,15 @@ public final class GuiTextures {
 
         public Composer warningPanel(int textureX) {
             return sprite(from(textureX), WARNING, WARNING_ADVANCE);
+        }
+
+        public Composer moneyPanel(int textureX) {
+            return sprite(from(textureX), MONEY_PANEL, MONEY_PANEL_ADVANCE);
+        }
+
+        /** The anvil's panel: its blue box sits under the anvil's own text field. */
+        public Composer moneyInput(int textureX) {
+            return sprite(from(textureX), MONEY_INPUT, MONEY_INPUT_ADVANCE);
         }
 
         public Composer line(int textureX, int offset, Text content) {

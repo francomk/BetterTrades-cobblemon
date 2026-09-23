@@ -17,14 +17,17 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.screen.ScreenHandlerType;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.text.Style;
 import net.minecraft.text.Text;
+import net.minecraft.text.TextColor;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * The trade screen. One per player, always mirrored: whoever is looking is on the left.
  *
- * The background, the head frames and the full-inventory panel are not slots: they are artwork
+ * The background, the head frames and the two side panels are not slots: they are artwork
  * slipped into the window title, see {@link GuiTextures}. The buttons, on the other hand, are
  * items with a model of their own, so the client draws them in the slot and hovering shows the lore.
  *
@@ -50,10 +53,23 @@ public final class TradeGui extends SimpleGuiBase {
     private static final int THEIR_NAME_END_X = 169;
     private static final int WARNING_X = 182;
     private static final int WARNING_CENTRE_X = 221;
+    /** The money panel mirrors the warning panel on the left, with the same 6px gap. */
+    private static final int MONEY_X = -85;
+    private static final int MONEY_LABEL_X = -77;
+    private static final int MONEY_CENTRE_X = -46;
+    /** Widest amount that fits inside a blue box, in pixels. */
+    private static final int MONEY_BOX_WIDTH = 62;
+    /** The amounts are lit like an LCD on the panel's blue boxes. */
+    private static final Style LCD = Style.EMPTY.withColor(TextColor.fromRgb(0xD4F4FF));
 
     /** The text lines, in pixels below the title line. Same values in gen_gui_assets.py. */
     private static final int NAME_LINE = 36;
     private static final int[] WARNING_LINES = {16, 29, 37, 45, 57, 65, 73};
+    private static final int MONEY_TITLE_LINE = -1;
+    private static final int MONEY_MY_LABEL_LINE = 18;
+    private static final int MONEY_MY_AMOUNT_LINE = 35;
+    private static final int MONEY_THEIR_LABEL_LINE = 54;
+    private static final int MONEY_THEIR_AMOUNT_LINE = 72;
 
     private final TradeScreens screens;
     private final TradeSession session;
@@ -141,11 +157,40 @@ public final class TradeGui extends SimpleGuiBase {
             composer.centred(WARNING_CENTRE_X, WARNING_LINES[line], warning.get(line));
         }
 
+        if (mine.money() > 0 || theirs.money() > 0) drawMoneyPanel(composer);
+
         Text title = composer.build();
         if (!title.getString().equals(drawnTitle)) {
             drawnTitle = title.getString();
             setTitle(title);
         }
+    }
+
+    /** The money on the table, on the left: shown as soon as either of them offers some. */
+    private void drawMoneyPanel(GuiTextures.Composer composer) {
+        composer.moneyPanel(MONEY_X)
+                .centred(MONEY_CENTRE_X, MONEY_TITLE_LINE, Lang.name("gui.money.panel.title"))
+                .line(MONEY_LABEL_X, MONEY_MY_LABEL_LINE, Lang.name("gui.trade.name.you"))
+                .centred(MONEY_CENTRE_X, MONEY_MY_AMOUNT_LINE, lcd(mine.money()))
+                .line(MONEY_LABEL_X, MONEY_THEIR_LABEL_LINE,
+                        Lang.name("gui.trade.name.other", theirs.playerName()))
+                .centred(MONEY_CENTRE_X, MONEY_THEIR_AMOUNT_LINE, lcd(theirs.money()));
+    }
+
+    /** An amount for the blue box: grouped digits, or a short form when those do not fit. */
+    private static Text lcd(long amount) {
+        String digits = String.format(Locale.ROOT, "%,d", amount);
+        if (GuiTextures.width(digits) > MONEY_BOX_WIDTH) {
+            String[] units = {"K", "M", "B", "T", "Q"};
+            double value = amount;
+            int unit = -1;
+            while (value >= 1000 && unit < units.length - 1) {
+                value /= 1000;
+                unit++;
+            }
+            digits = String.format(Locale.ROOT, value < 100 ? "%.1f%s" : "%.0f%s", value, units[unit]);
+        }
+        return Text.literal(digits).setStyle(LCD);
     }
 
     /**

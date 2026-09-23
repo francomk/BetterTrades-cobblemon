@@ -3,6 +3,7 @@ package com.bettertrades.gui;
 import com.bettertrades.economy.MoneyService;
 import com.bettertrades.lang.Lang;
 import com.bettertrades.trade.TradeSession;
+import com.bettertrades.util.Sounds;
 import com.bettertrades.util.Texts;
 import eu.pb4.sgui.api.ClickType;
 import eu.pb4.sgui.api.elements.GuiElementBuilder;
@@ -16,10 +17,17 @@ import net.minecraft.server.network.ServerPlayerEntity;
 /**
  * The amount is typed into an anvil: a slot screen has no text fields, and a chat command will not
  * do because opening the chat closes the window and would cancel the trade.
+ *
+ * The panel is artwork in the title, like the trade screen's (see {@link GuiTextures}): its blue
+ * box lies under the anvil's own text field, so the typed amount shows up on the display, and
+ * the back and confirm buttons are items on the anvil's second input slot and its output slot.
  */
 public final class MoneyInputGui extends AnvilInputGui implements SessionScreen {
 
+    private static final int BACK_SLOT = 1;
     private static final int CONFIRM_SLOT = 2;
+    /** Where the panel starts on the anvil texture: the buttons then fall on slots 1 and 2. */
+    private static final int PANEL_X = 40;
 
     private final TradeScreens screens;
     private final TradeSession session;
@@ -40,11 +48,15 @@ public final class MoneyInputGui extends AnvilInputGui implements SessionScreen 
         this.screens = screens;
         this.session = screens.session();
         this.parent = parent;
-        setTitle(Lang.text("gui.money.title"));
+        setTitle(GuiTextures.anvilComposer().moneyInput(PANEL_X).build());
         setDefaultInputValue(String.valueOf(session.sideOf(player.getUuid()).money()));
         setSlot(0, new GuiElementBuilder(Items.PAPER)
                 .setName(Lang.name("gui.money.input"))
                 .setLore(Lang.lines("gui.money.input.lore"))
+                .build());
+        setSlot(BACK_SLOT, GuiElementBuilder.from(Icons.moneyBack())
+                .setName(Lang.name("gui.money.back"))
+                .setLore(Lang.lines("gui.money.back.lore"))
                 .build());
         drawConfirm(0);
     }
@@ -54,7 +66,7 @@ public final class MoneyInputGui extends AnvilInputGui implements SessionScreen 
     }
 
     private void drawConfirm(long amount) {
-        setSlot(CONFIRM_SLOT, new GuiElementBuilder(Items.GOLD_NUGGET)
+        setSlot(CONFIRM_SLOT, GuiElementBuilder.from(Icons.moneyConfirm())
                 .setName(Lang.name("gui.money.confirm", amount))
                 .setLore(Lang.lines("gui.money.confirm.lore"))
                 .build());
@@ -69,6 +81,11 @@ public final class MoneyInputGui extends AnvilInputGui implements SessionScreen 
     public boolean onClick(int index, ClickType type, SlotActionType action, GuiElementInterface element) {
         if (session.stage() == TradeSession.Stage.CLOSED) {
             closeQuietly();
+            return false;
+        }
+        if (index == BACK_SLOT) {
+            Sounds.click(getPlayer());
+            parent.open();
             return false;
         }
         if (index != CONFIRM_SLOT) return false;

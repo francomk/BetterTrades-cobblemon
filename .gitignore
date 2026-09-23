@@ -11,3 +11,7 @@ run/
 
 # macOS
 .DS_Store
+
+# Local notes and mockups, kept out of the release
+-TEST-/
+temp.gui/

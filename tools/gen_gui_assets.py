@@ -3,7 +3,7 @@
 
 The generated assets are committed under src/main/resources, so the mod builds without running
 this script. The source mockups (guis/) are not part of this repository: ask on Discord if you
-need them to regenerate the artwork.
+need them to regenerate the artwork. BETTERTRADES_GUIS points the script at another folder.
 
 Everything this writes under src/main/resources is generated: editing those files by
 hand means losing the edit at the next run. Change the mockup or this script instead.
@@ -34,7 +34,7 @@ import zipfile
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GUIS = os.path.join(ROOT, "guis")
+GUIS = os.environ.get("BETTERTRADES_GUIS", os.path.join(ROOT, "guis"))
 RESOURCES = os.path.join(ROOT, "src", "main", "resources")
 ASSETS = os.path.join(RESOURCES, "assets", "bettertrades")
 LANG = os.path.join(ASSETS, "lang", "en_us.json")
@@ -45,6 +45,8 @@ CLEAR = (0, 0, 0, 0)
 MOCKUP = "Gui_BetterTrades copia.png"
 LOCKED = "trade copia/trade_locked_%s.png"
 WARN = "trade copia/Attenzione_invpieno_betterTrades.png"
+MONEY_PANEL = "Gui_latosinistro_OffertaSoldiBetterTrades copia.png"
+MONEY_INPUT = "Gui_OffriSoldi_AnvilGUI_BetterTrades copia.png"
 
 # --- what to cut out of the mockup ---------------------------------------------------
 
@@ -58,6 +60,15 @@ BTN_TRASH = (43, 119, 61, 137)       # 18x18
 BTN_MONEY = (114, 118, 134, 138)     # 20x20
 CANCEL = (38, 8, 94, 24)             # 56x16 inside every trade_locked_N
 HEAD_GREEN = (0, 4, 24, 28)          # 24x24 inside trade_locked_other
+
+# The money panel, which slides out on the left of the trade screen.
+MONEY_PANEL_LABELS = ((3, 17, 76, 32), (3, 57, 76, 69))   # "Tu" / "Lui" rows, cleared
+
+# The anvil where the amount is typed. Its blue box sits under the anvil's own text field,
+# and the two buttons land on the anvil's second input slot and on its output slot.
+MONEY_INPUT_PLAQUE = (28, 3, 118, 14)   # inside of the title tab, words only
+MONEY_BACK = (35, 50, 54, 66)           # 19x16, on slot 1
+MONEY_CONFIRM = (92, 50, 111, 66)       # 19x16, on slot 2
 
 # The middle button of the row keeps the mockup's frame in the background, because a real
 # Cobblemon Poke Ball is drawn in the slot on top of it.
@@ -76,6 +87,7 @@ WIDE_CANVAS = 64
 
 LABEL_OFFSET = 36                    # the player names, on the mockup's "Tu" / "Lui" row
 WARN_LINES = (16, 29, 37, 45, 57, 65, 73)
+MONEY_LINES = (-1, 18, 35, 54, 72)   # heading, "You", your amount, "Them", their amount
 
 # --- vertical placement of the sprites, as `ascent` values ---------------------------
 # ascent = 7 - (pixels below the title line), so a sprite drawn above it has ascent > 7.
@@ -83,6 +95,13 @@ WARN_LINES = (16, 29, 37, 45, 57, 65, 73)
 BACKGROUND_ASCENT = 25               # texture top at y - 12
 HEAD_FRAME_ASCENT = -1               # frame top at y + 14
 WARN_PANEL_ASCENT = 13               # panel top at y
+MONEY_PANEL_ASCENT = 13              # level with the warning panel
+MONEY_INPUT_ASCENT = 16              # anvil: title line at y + 6, panel top at y - 3
+
+# Where an anvil button's art starts, relative to the slot it covers. The buttons in the
+# mockup are 57px apart and the slots 58, so each one gets its own offset.
+MONEY_BACK_AT = (-1, 0)
+MONEY_CONFIRM_AT = (-2, 0)
 
 
 def load(name):
@@ -96,6 +115,18 @@ def fill(image, box, colour):
 def centred(art, canvas):
     out = Image.new("RGBA", (canvas, canvas), CLEAR)
     out.paste(art, ((canvas - art.width) // 2, (canvas - art.height) // 2))
+    return out
+
+
+def in_slot(art, at, canvas=ITEM_CANVAS):
+    """Places button art so it lands `at` pixels from the slot's own top-left corner.
+
+    The model draws the canvas centred on the slot, one texture pixel per screen pixel, so
+    the slot's corner is canvas pixel (canvas - 16) / 2.
+    """
+    corner = (canvas - 16) // 2
+    out = Image.new("RGBA", (canvas, canvas), CLEAR)
+    out.paste(art, (corner + at[0], corner + at[1]))
     return out
 
 
@@ -246,7 +277,7 @@ def write_fonts(sprites, providers):
     glyphs.append({"type": "space", "advances": space_advances()})
     save_json({"providers": glyphs}, "font", "gui.json")
 
-    for offset in sorted({LABEL_OFFSET, *WARN_LINES}):
+    for offset in sorted({LABEL_OFFSET, *WARN_LINES, *MONEY_LINES}):
         shifted = []
         for provider in providers:
             moved = dict(provider)
@@ -323,6 +354,22 @@ def main():
                 warn_pixels[x, y] = fill_colour
     save(warn, "textures", "gui", "warn_panel.png")
 
+    money_panel = load(MONEY_PANEL)
+    for box in MONEY_PANEL_LABELS:
+        fill(money_panel, box, PANEL)
+    money_panel = money_panel.crop(money_panel.getbbox())
+    save(money_panel, "textures", "gui", "money_panel.png")
+
+    # The anvil's words sit above the title line, like the trade screen's plaque, so they
+    # are painted in.
+    money_input = load(MONEY_INPUT)
+    back = money_input.crop(MONEY_BACK)
+    confirm_money = money_input.crop(MONEY_CONFIRM)
+    for box in (MONEY_INPUT_PLAQUE, MONEY_BACK, MONEY_CONFIRM):
+        fill(money_input, box, PANEL)
+    font.centre(money_input, MONEY_INPUT_PLAQUE, say("gui.money.plaque"), PLAQUE_TEXT_COLOUR)
+    save(money_input, "textures", "gui", "money_input.png")
+
     # ------------------------------------------------------------------ item art
     confirm = mockup.crop(CONFIRM)
     save(centred(label(font, confirm, say("gui.button.confirm"), WHITE, CONFIRM_SHADOW),
@@ -340,11 +387,14 @@ def main():
     save(centred(mockup.crop(BTN_TRASH), ITEM_CANVAS), "textures", "item", "btn_trash.png")
     save(centred(money, ITEM_CANVAS), "textures", "item", "btn_money.png")
     save(centred(dim(money, 0.45), ITEM_CANVAS), "textures", "item", "btn_money_off.png")
+    save(in_slot(back, MONEY_BACK_AT), "textures", "item", "btn_money_back.png")
+    save(in_slot(confirm_money, MONEY_CONFIRM_AT), "textures", "item", "btn_money_confirm.png")
 
     # ------------------------------------------------------------------ item models
     canvases = {"btn_confirm": WIDE_CANVAS, "btn_confirm_done": WIDE_CANVAS,
                 "btn_trash": ITEM_CANVAS, "btn_money": ITEM_CANVAS,
-                "btn_money_off": ITEM_CANVAS}
+                "btn_money_off": ITEM_CANVAS, "btn_money_back": ITEM_CANVAS,
+                "btn_money_confirm": ITEM_CANVAS}
     canvases.update({"btn_cancel_%d" % frame: WIDE_CANVAS for frame in range(1, 9)})
     for name, canvas in sorted(canvases.items()):
         scale = canvas / 16.0
@@ -360,6 +410,8 @@ def main():
         "": ("gui/head_frame_idle.png", head_idle, HEAD_FRAME_ASCENT),
         "": ("gui/head_frame_ready.png", head_ready, HEAD_FRAME_ASCENT),
         "": ("gui/warn_panel.png", warn, WARN_PANEL_ASCENT),
+        "": ("gui/money_panel.png", money_panel, MONEY_PANEL_ASCENT),
+        "": ("gui/money_input.png", money_input, MONEY_INPUT_ASCENT),
     }
     write_fonts(sprites, font.providers)
     save_json(font.advances(), "bettertrades", "font_widths.json", root=RESOURCES)

@@ -27,7 +27,8 @@ import java.nio.file.Path;
  * The models scale themselves up so one texture pixel covers one screen pixel, which is how
  * they land exactly where the mockup drew them - see tools/gen_gui_assets.py.
  *
- * The other screens still use vanilla items. They get their own artwork when their mockups do.
+ * The money anvil's two buttons work the same way. The other screens still use vanilla items:
+ * they get their own artwork when their mockups do.
  */
 public final class Icons {
 
@@ -38,6 +39,8 @@ public final class Icons {
     private static PolymerModelData moneyOff;
     private static PolymerModelData confirm;
     private static PolymerModelData confirmDone;
+    private static PolymerModelData moneyBack;
+    private static PolymerModelData moneyConfirm;
     private static final PolymerModelData[] cancel = new PolymerModelData[CANCEL_FRAMES];
 
     private Icons() {}
@@ -52,6 +55,8 @@ public final class Icons {
         moneyOff = model("btn_money_off");
         confirm = model("btn_confirm");
         confirmDone = model("btn_confirm_done");
+        moneyBack = model("btn_money_back");
+        moneyConfirm = model("btn_money_confirm");
         for (int frame = 0; frame < CANCEL_FRAMES; frame++) {
             cancel[frame] = model("btn_cancel_" + (frame + 1));
         }
@@ -131,6 +136,14 @@ public final class Icons {
     /** The cancel button fades over the countdown: frame 0 is full red, frame 7 nearly gone. */
     public static ItemStack cancel(int frame) {
         return cancel[Math.clamp(frame, 0, CANCEL_FRAMES - 1)].asStack();
+    }
+
+    public static ItemStack moneyBack() {
+        return moneyBack.asStack();
+    }
+
+    public static ItemStack moneyConfirm() {
+        return moneyConfirm.asStack();
     }
 
     public static int cancelFrames() {
