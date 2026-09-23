@@ -23,9 +23,9 @@ import java.util.List;
  * evolutions stopped happening across the whole server.
  *
  * Cobblemon's event knows one kind of trade only: one Pokemon for one Pokemon. A BetterTrades one
- * moves up to eight per side, with items and money in between, so the pairs are formed by position
- * and the shorter side wraps around ({@link #pairs}): every traded Pokemon shows up in at least
- * one event, which is what a listener needs to forbid it or to record it. KNOWN LIMIT: if one side
+ * moves up to eight per side, with items and money in between, so the pairs are formed by position.
+ * For the veto the shorter side wraps around ({@link #pairs}), so every traded Pokemon is asked
+ * about; for the post event it does not, so no Pokemon is counted twice. KNOWN LIMIT: if one side
  * offers no Pokemon at all - Pokemon against items or money only - there is no pair to build and
  * the event does not fire, because the only alternative would be inventing a second Pokemon and
  * presenting it to listeners as traded.
@@ -77,11 +77,18 @@ final class CobblemonTrade {
      * A copy of performTrade's logic: among the locked evolutions only the TradeEvolutions are taken
      * and the first one that fires wins. The list is copied before iterating because a successful
      * evolution touches the Pokemon's locked evolutions.
+     *
+     * Exactly one attempt per Pokemon, against the Pokemon at the same position on the other side.
+     * Walking the wrapped pairs instead made the lone Pokemon of a one-against-three trade try three
+     * times, each time against a different counterpart.
      */
     static void evolve(String tradeId, List<Pokemon> fromLeft, List<Pokemon> fromRight) {
-        for (Pair pair : pairs(fromLeft, fromRight)) {
-            attempt(tradeId, pair.fromLeft(), pair.fromRight());
-            attempt(tradeId, pair.fromRight(), pair.fromLeft());
+        if (fromLeft.isEmpty() || fromRight.isEmpty()) return;
+        for (int i = 0; i < fromLeft.size(); i++) {
+            attempt(tradeId, fromLeft.get(i), fromRight.get(i % fromRight.size()));
+        }
+        for (int i = 0; i < fromRight.size(); i++) {
+            attempt(tradeId, fromRight.get(i), fromLeft.get(i % fromLeft.size()));
         }
     }
 
@@ -121,10 +128,20 @@ final class CobblemonTrade {
         }
     }
 
-    /** Fires TRADE_EVENT_POST on the Pokemon really delivered, as performTrade does once done. */
+    /**
+     * Fires TRADE_EVENT_POST on the Pokemon really delivered, as performTrade does once done.
+     *
+     * Only the position-by-position pairs, without wrapping: a listener counting trades - quests,
+     * statistics, "trade N Pokemon" rewards - must see each Pokemon once. With wrapping, one Pokemon
+     * against eight was eight trades. The extra Pokemon on the longer side have no partner left and
+     * get no event, the same known limit as a Pokemon traded for items only.
+     */
     static void firePost(String tradeId, ServerPlayerEntity leftPlayer, List<Pokemon> fromLeft,
                          ServerPlayerEntity rightPlayer, List<Pokemon> fromRight) {
-        List<Pair> pairs = pairs(fromLeft, fromRight);
+        List<Pair> pairs = new ArrayList<>();
+        for (int i = 0; i < Math.min(fromLeft.size(), fromRight.size()); i++) {
+            pairs.add(new Pair(fromLeft.get(i), fromRight.get(i)));
+        }
         if (pairs.isEmpty()) return;
 
         TradeParticipant one = new PlayerTradeParticipant(leftPlayer);
@@ -141,8 +158,9 @@ final class CobblemonTrade {
     }
 
     /**
-     * The pairs Cobblemon is spoken to with. The shorter side wraps around, so every traded Pokemon
-     * shows up at least once; with one side empty there is no pair and nothing comes out.
+     * The pairs the veto is asked about. The shorter side wraps around, so every traded Pokemon
+     * shows up at least once - a listener that forbids a Pokemon has to see it - and asking twice
+     * about the same one is harmless for a veto. With one side empty there is no pair.
      */
     private static List<Pair> pairs(List<Pokemon> fromLeft, List<Pokemon> fromRight) {
         if (fromLeft.isEmpty() || fromRight.isEmpty()) return List.of();

@@ -7,6 +7,7 @@ import com.bettertrades.db.Dialect;
 import com.bettertrades.db.EscrowDb;
 import com.bettertrades.db.Ulid;
 import com.bettertrades.util.Payloads;
+import com.bettertrades.util.PlayerSaves;
 import com.bettertrades.util.Texts;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
@@ -102,9 +103,74 @@ public final class EscrowService {
         settle(server, tradeId, RETURNED, items, notify);
     }
 
-    /** Delivery once the trade is done: the escrow closes as CONSUMED and the item changes owner. */
-    public static void handOver(MinecraftServer server, String tradeId, List<Custody> items) {
-        settle(server, tradeId, CONSUMED, items, false);
+    /**
+     * First half of a completed trade: closes the rows as CONSUMED and answers with the ids that
+     * really moved. Nothing is delivered here: the session does that with {@link #deliver} once
+     * it knows the rest of the trade can still go through.
+     */
+    public static CompletableFuture<List<String>> consume(List<String> escrowIds) {
+        return claim(escrowIds, CONSUMED);
+    }
+
+    /**
+     * Hands over items whose rows are already closed. Server thread only.
+     *
+     * Whoever has disconnected in the meantime gets a fresh HELD row in their name instead, and
+     * every recipient's file is written straight away: the closed row is already durable, the
+     * inventory has to be too.
+     */
+    public static void deliver(MinecraftServer server, String tradeId, List<Custody> items) {
+        java.util.Set<ServerPlayerEntity> touched = new java.util.LinkedHashSet<>();
+        for (Custody item : items) {
+            ServerPlayerEntity recipient = deliverOne(server, tradeId, item);
+            if (recipient != null) touched.add(recipient);
+        }
+        touched.forEach(PlayerSaves::inventory);
+    }
+
+    /**
+     * One item of {@link #deliver}, without the file write: for a caller that saves on its own.
+     *
+     * @return who received it, or null when it went back into escrow in their name
+     */
+    public static ServerPlayerEntity deliverOne(MinecraftServer server, String tradeId, Custody item) {
+        ServerPlayerEntity recipient = online(server, item.toPlayer());
+        if (recipient == null) {
+            rehold(server, tradeId, item);
+            return null;
+        }
+        give(recipient, item.stack());
+        return recipient;
+    }
+
+    /**
+     * Undoes a {@link #consume} whose trade did not go through after all: the items go back to
+     * whoever offered them, and the rows are relabelled RETURNED so the table tells the truth.
+     *
+     * Delivery does not wait for the relabel. Both states are terminal, so a relabel that fails
+     * cannot bring the item back a second time; waiting on it would only risk losing the item when
+     * the database is the very thing that is failing.
+     */
+    public static void restore(MinecraftServer server, String tradeId, List<Custody> toOwners) {
+        if (toOwners.isEmpty()) return;
+        deliver(server, tradeId, toOwners);
+        List<String> ids = new ArrayList<>(toOwners.size());
+        for (Custody item : toOwners) ids.add(item.escrowId());
+        EscrowDb.execute(connection -> {
+            try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE escrow SET state = '" + RETURNED + "', resolved_at = ? WHERE id = ? AND state = '"
+                            + CONSUMED + "'")) {
+                for (String id : ids) {
+                    update.setLong(1, System.currentTimeMillis());
+                    update.setString(2, id);
+                    update.executeUpdate();
+                }
+            }
+        }).exceptionally(error -> {
+            BetterTrades.LOGGER.warn("Trade {}: {} escrow rows given back but still labelled {}",
+                    tradeId, ids.size(), CONSUMED, error);
+            return null;
+        });
     }
 
     /**
@@ -167,6 +233,8 @@ public final class EscrowService {
                 give(recipient, item.stack());
                 handed.merge(item.toPlayer(), 1, Integer::sum);
             }
+            // The row is closed and durable: the inventory holding the item has to be as well.
+            handed.keySet().forEach(player -> PlayerSaves.inventory(online(server, player)));
             if (!notify) return;
             handed.forEach((player, count) -> {
                 ServerPlayerEntity recipient = online(server, player);

@@ -1,14 +1,20 @@
 package com.bettertrades.blacklist;
 
+import com.cobblemon.mod.common.api.pokemon.PokemonSpecies;
 import com.cobblemon.mod.common.pokemon.Pokemon;
 import com.bettertrades.BetterTrades;
 import com.bettertrades.db.Columns;
 import com.bettertrades.db.Database;
+import com.bettertrades.db.Replay;
 import com.bettertrades.db.Ulid;
 import com.bettertrades.escrow.EscrowService;
 import com.bettertrades.lang.Lang;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.BundleContentsComponent;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.util.Identifier;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -18,6 +24,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -33,30 +40,72 @@ public final class Blacklist {
     private static final AtomicReference<List<BlacklistRule>> CACHE =
             new AtomicReference<>(List.of());
 
+    /**
+     * True once this server run has read the rules from the primary backend.
+     *
+     * An empty cache does not tell "never loaded" apart from "no rules". Keying the fallback guard
+     * on emptiness meant that a server starting with MariaDB down always took SQLite's list, which
+     * held only the rules born in some earlier fallback: everything else went back on the market.
+     */
+    private static volatile boolean loadedFromPrimary;
+
+    /** How deep a container inside a container is searched before the item is refused outright. */
+    private static final int MAX_NESTING = 16;
+
     private Blacklist() {}
 
     public static List<BlacklistRule> rules() {
         return CACHE.get();
     }
 
+    /** Server shutdown: the next world starts from the database, not from this one's cache. */
+    public static void clear() {
+        CACHE.set(List.of());
+        loadedFromPrimary = false;
+    }
+
+    private record Loaded(List<BlacklistRule> rules, boolean fromPrimary) {}
+
     /**
-     * In fallback the rules are NOT replaced.
+     * In fallback the rules are NOT replaced once the primary's have been seen.
      *
-     * SQLite never received the ones written to MariaDB, so readAll() returns an empty list that
-     * does not mean "there are no rules" but "this backend does not have them". Overwriting the
-     * cache with it would put everything blacklisted back on the market, without a warning and
-     * without the second check at commit noticing: it uses the same cache.
+     * SQLite never received the ones written to MariaDB directly, so what it returns is a local copy
+     * that can be behind. Overwriting a cache loaded from MariaDB with it could put blacklisted
+     * things back on the market, without a warning and without the second check at commit noticing:
+     * it uses the same cache.
+     *
+     * A server that STARTS in fallback has nothing better, and uses that copy. It is kept current by
+     * {@link Replay#mirrorBlacklist} on every read from MariaDB, so it is as recent as the last time
+     * MariaDB answered.
      */
     public static CompletableFuture<Void> reload() {
-        return Database.supply(Blacklist::readAll)
-                .thenAccept(rules -> {
-                    if (Database.degraded() && !CACHE.get().isEmpty()) {
+        return Database.supply(connection -> {
+                    List<BlacklistRule> rules = readAll(connection);
+                    boolean fromPrimary = !Database.degraded();
+                    if (Database.backend() == Database.Backend.MARIADB) {
+                        try {
+                            Replay.mirrorBlacklist(connection, Database.localFile());
+                        } catch (SQLException | RuntimeException e) {
+                            BetterTrades.LOGGER.warn("Local copy of the blacklist not updated: a start"
+                                    + " in fallback would use an older one", e);
+                        }
+                    }
+                    return new Loaded(rules, fromPrimary);
+                })
+                .thenAccept(loaded -> {
+                    if (!loaded.fromPrimary() && loadedFromPrimary) {
                         BetterTrades.LOGGER.warn("Database in fallback: the in-memory blacklist stays"
                                 + " the MariaDB one ({} rules), the {} read from SQLite are ignored",
-                                CACHE.get().size(), rules.size());
+                                CACHE.get().size(), loaded.rules().size());
                         return;
                     }
-                    CACHE.set(rules);
+                    if (!loaded.fromPrimary()) {
+                        BetterTrades.LOGGER.warn("Blacklist loaded from the local copy ({} rules):"
+                                + " MariaDB is not answering, rules added there since the last copy"
+                                + " are missing until it comes back", loaded.rules().size());
+                    }
+                    CACHE.set(loaded.rules());
+                    if (loaded.fromPrimary()) loadedFromPrimary = true;
                 })
                 .exceptionally(error -> {
                     BetterTrades.LOGGER.error("Blacklist not loaded: the in-memory one stays", error);
@@ -81,18 +130,42 @@ public final class Blacklist {
         });
     }
 
-    /** Why it is blocked, when the item is blacklisted. */
+    /**
+     * Why it is blocked, when the item is blacklisted, or when it carries one that is.
+     *
+     * The contents count as much as the container: a shulker box or a bundle full of a banned item
+     * is that item, and checking only the outer id let it through both on offer and at commit.
+     */
     public static Optional<String> check(ItemStack stack) {
+        if (CACHE.get().isEmpty()) return Optional.empty();
+        return check(stack, 0);
+    }
+
+    private static Optional<String> check(ItemStack stack, int depth) {
+        if (stack.isEmpty()) return Optional.empty();
         String itemId = Registries.ITEM.getId(stack.getItem()).toString();
         for (BlacklistRule rule : CACHE.get()) {
             if (rule instanceof BlacklistRule.Item item && item.itemId().equals(itemId)) {
                 return Optional.of(describe(rule));
             }
         }
+        List<ItemStack> inside = new ArrayList<>();
+        ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
+        if (container != null) container.iterateNonEmpty().forEach(inside::add);
+        BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+        if (bundle != null) bundle.iterate().forEach(inside::add);
+        if (inside.isEmpty()) return Optional.empty();
+        // Bundles go inside bundles: past this depth the contents are not read any more, and an
+        // item that cannot be checked is not traded.
+        if (depth >= MAX_NESTING) return Optional.of(Lang.raw("chat.error.item_too_nested"));
+        for (ItemStack inner : inside) {
+            Optional<String> blocked = check(inner, depth + 1);
+            if (blocked.isPresent()) return blocked;
+        }
         return Optional.empty();
     }
 
-    /** Why it is blocked, when the Pokemon falls under a rule. */
+    /** Why it is blocked, when the Pokemon falls under a rule or holds a blacklisted item. */
     public static Optional<String> check(Pokemon pokemon) {
         String species = pokemon.getSpecies().getResourceIdentifier().toString();
         String form = pokemon.getForm().getName();
@@ -105,7 +178,52 @@ public final class Blacklist {
             if (!aspects.containsAll(mon.aspects())) continue;
             return Optional.of(describe(rule));
         }
-        return Optional.empty();
+        // The held item travels with the Pokemon: a harmless Pokemon holding a banned item is the
+        // banned item.
+        return check(pokemon.heldItem());
+    }
+
+    /**
+     * The canonical form of an item id, or null when no such item is registered.
+     *
+     * A bare path gets Minecraft's namespace, as everywhere else in the game. The rule has to be
+     * stored in this form: check() compares against the registry's full id, and a rule saved as
+     * "diamond" never matched "minecraft:diamond".
+     */
+    public static String itemId(String raw) {
+        if (raw == null) return null;
+        Identifier parsed = Identifier.tryParse(raw.trim().toLowerCase(Locale.ROOT));
+        if (parsed == null || !Registries.ITEM.containsId(parsed)) return null;
+        return parsed.toString();
+    }
+
+    /**
+     * The canonical form of a species id, or null when Cobblemon has no such species.
+     *
+     * A bare name, or one given Minecraft's default namespace by the command parser, is looked up
+     * under "cobblemon" too: no species lives in the minecraft namespace.
+     */
+    public static String speciesId(String raw) {
+        if (raw == null) return null;
+        String lower = raw.trim().toLowerCase(Locale.ROOT);
+        Identifier parsed = Identifier.tryParse(lower.contains(":") ? lower : "cobblemon:" + lower);
+        if (parsed == null) return null;
+        if (PokemonSpecies.getByIdentifier(parsed) != null) return parsed.toString();
+        if (!"minecraft".equals(parsed.getNamespace())) return null;
+        Identifier cobblemon = Identifier.tryParse("cobblemon:" + parsed.getPath());
+        return cobblemon != null && PokemonSpecies.getByIdentifier(cobblemon) != null
+                ? cobblemon.toString() : null;
+    }
+
+    /**
+     * The same normalisation without the registry lookup, for rules already stored: an item or a
+     * species that is no longer registered must still load, and rules written before ids were
+     * normalised must still match.
+     */
+    private static String stored(String raw, String namespace) {
+        if (raw == null) return null;
+        String lower = raw.trim().toLowerCase(Locale.ROOT);
+        return lower.contains(":") ? lower : namespace + ":" + lower;
     }
 
     private static String describe(BlacklistRule rule) {
@@ -114,13 +232,18 @@ public final class Blacklist {
     }
 
     public static CompletableFuture<String> addItem(String rawItemId, String rawReason, String rawAddedBy) {
+        String canonical = itemId(rawItemId);
+        if (canonical == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("No item is registered as " + rawItemId));
+        }
         String id = Ulid.next();
         // Text columns are cut to MariaDB's width even when writing to SQLite: added_by comes from
         // context.getSource().getName(), which with /execute as <entity> can be a custom name, and
         // reason from a greedyString with no limit. On MariaDB with STRICT_TRANS_TABLES a value that
         // is too long fails the INSERT instead of being truncated, so the same command would succeed
         // on one backend and not on the other.
-        String itemId = Columns.truncate(rawItemId, Columns.IDENT);
+        String itemId = Columns.truncate(canonical, Columns.IDENT);
         String reason = Columns.truncate(rawReason, Columns.LONGTEXT);
         String addedBy = Columns.truncate(rawAddedBy, Columns.SHORT);
         return Database.supply(connection -> {
@@ -146,8 +269,13 @@ public final class Blacklist {
     public static CompletableFuture<String> addPokemon(String rawSpeciesId, String rawForm,
                                                        Set<String> aspects, String rawReason,
                                                        String rawAddedBy) {
+        String canonical = speciesId(rawSpeciesId);
+        if (canonical == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalArgumentException("No species is registered as " + rawSpeciesId));
+        }
         String id = Ulid.next();
-        String speciesId = Columns.truncate(rawSpeciesId, Columns.IDENT);
+        String speciesId = Columns.truncate(canonical, Columns.IDENT);
         String form = Columns.truncate(rawForm, Columns.SHORT);
         String reason = Columns.truncate(rawReason, Columns.LONGTEXT);
         String addedBy = Columns.truncate(rawAddedBy, Columns.SHORT);
@@ -226,7 +354,7 @@ public final class Blacklist {
                 "SELECT id, item_id, reason, added_by FROM blacklist_item WHERE revoked_at IS NULL");
              ResultSet rows = select.executeQuery()) {
             while (rows.next()) {
-                rules.add(new BlacklistRule.Item(rows.getString(1), rows.getString(2),
+                rules.add(new BlacklistRule.Item(rows.getString(1), stored(rows.getString(2), "minecraft"),
                         rows.getString(3), rows.getString(4)));
             }
         }
@@ -246,7 +374,7 @@ public final class Blacklist {
              ResultSet rows = select.executeQuery()) {
             while (rows.next()) {
                 String id = rows.getString(1);
-                rules.add(new BlacklistRule.Mon(id, rows.getString(2), rows.getString(3),
+                rules.add(new BlacklistRule.Mon(id, stored(rows.getString(2), "cobblemon"), rows.getString(3),
                         Set.copyOf(aspectsByRule.getOrDefault(id, Set.of())),
                         rows.getString(4), rows.getString(5)));
             }

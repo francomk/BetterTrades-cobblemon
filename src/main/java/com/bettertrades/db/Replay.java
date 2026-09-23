@@ -64,6 +64,15 @@ public final class Replay {
                     forget(source, entry);
                     done++;
                 } catch (SQLException e) {
+                    // The rows this entry had already inserted are still in the open transaction:
+                    // without the rollback the NEXT entry's commit would publish them, and MariaDB
+                    // would show half a trade - no items, or no Pokemon - for as long as this entry
+                    // keeps failing. A failed statement does not end the transaction on its own there.
+                    try {
+                        target.rollback();
+                    } catch (SQLException rollback) {
+                        BetterTrades.LOGGER.warn("Replay rollback failed: {}", rollback.getMessage());
+                    }
                     BetterTrades.LOGGER.error("Replay of {} {} failed: left queued",
                             entry.kind(), entry.entityId(), e);
                 }
@@ -75,6 +84,11 @@ public final class Replay {
     private static void replayTrade(Connection source, Connection target, String tradeId) throws SQLException {
         copy(source, target, "player",
                 "uuid IN (SELECT player_uuid FROM trade_participant WHERE trade_id = ?)", tradeId);
+        // The names seen during the fallback, which the history needs to show the name of the time,
+        // and the current one: INSERT IGNORE on player keeps MariaDB's older name otherwise.
+        copy(source, target, "player_name_history",
+                "player_uuid IN (SELECT player_uuid FROM trade_participant WHERE trade_id = ?)", tradeId);
+        copyCurrentNames(source, target, tradeId);
         copy(source, target, "item",
                 "identifier IN (SELECT item_id FROM trade_item WHERE trade_id = ?)", tradeId);
         copy(source, target, "item",
@@ -112,18 +126,108 @@ public final class Replay {
         copy(source, target, "blacklist_pokemon_aspect", "blacklist_id = ?", ruleId);
     }
 
-    /** Copies rows between two backends without knowing their columns: it asks the ResultSet. */
+    /**
+     * Replay runs in fallback order, so SQLite's current name for a player of this trade is at
+     * least as recent as the trade itself.
+     */
+    private static void copyCurrentNames(Connection source, Connection target, String tradeId)
+            throws SQLException {
+        try (PreparedStatement select = source.prepareStatement(
+                "SELECT uuid, current_name FROM player WHERE uuid IN"
+                        + " (SELECT player_uuid FROM trade_participant WHERE trade_id = ?)");
+             PreparedStatement update = target.prepareStatement(
+                     "UPDATE player SET current_name = ? WHERE uuid = ?")) {
+            select.setString(1, tradeId);
+            try (ResultSet rows = select.executeQuery()) {
+                while (rows.next()) {
+                    update.setString(1, rows.getString(2));
+                    update.setString(2, rows.getString(1));
+                    update.executeUpdate();
+                }
+            }
+        }
+    }
+
+    /**
+     * Keeps a copy of MariaDB's active blacklist in the local SQLite file.
+     *
+     * Replay only goes from SQLite to MariaDB, so a server that started with MariaDB down used to
+     * find on SQLite only the rules born in some earlier fallback. Called on every read from MariaDB,
+     * this makes the local copy as recent as the last time MariaDB answered. Revocations are carried
+     * too, except for rules still waiting in the replay queue: those were born here and MariaDB has
+     * simply not received them yet.
+     */
+    public static void mirrorBlacklist(Connection primary, Path sqliteFile) throws SQLException {
+        if (sqliteFile == null) return;
+        try (Connection local = DriverManager.getConnection("jdbc:sqlite:" + sqliteFile)) {
+            Schema.applyTo(local, Dialect.SQLITE);
+            local.setAutoCommit(false);
+            try {
+                copy(primary, local, Dialect.SQLITE, "item",
+                        "identifier IN (SELECT item_id FROM blacklist_item WHERE revoked_at IS NULL)", null);
+                copy(primary, local, Dialect.SQLITE, "species",
+                        "identifier IN (SELECT species_id FROM blacklist_pokemon WHERE revoked_at IS NULL)", null);
+                copy(primary, local, Dialect.SQLITE, "blacklist_item", "revoked_at IS NULL", null);
+                copy(primary, local, Dialect.SQLITE, "blacklist_pokemon", "revoked_at IS NULL", null);
+                copy(primary, local, Dialect.SQLITE, "blacklist_pokemon_aspect",
+                        "blacklist_id IN (SELECT id FROM blacklist_pokemon WHERE revoked_at IS NULL)", null);
+                revokeMissing(primary, local, "blacklist_item", "BLACKLIST_ITEM");
+                revokeMissing(primary, local, "blacklist_pokemon", "BLACKLIST_POKEMON");
+                local.commit();
+            } catch (SQLException | RuntimeException e) {
+                local.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private static void revokeMissing(Connection primary, Connection local, String table, String kind)
+            throws SQLException {
+        java.util.Set<String> active = new java.util.HashSet<>();
+        try (PreparedStatement select = primary.prepareStatement(
+                "SELECT id FROM " + table + " WHERE revoked_at IS NULL");
+             ResultSet rows = select.executeQuery()) {
+            while (rows.next()) active.add(rows.getString(1));
+        }
+        List<String> stale = new ArrayList<>();
+        try (PreparedStatement select = local.prepareStatement(
+                "SELECT id FROM " + table + " WHERE revoked_at IS NULL AND id NOT IN"
+                        + " (SELECT entity_id FROM replay_pending WHERE kind = ?)")) {
+            select.setString(1, kind);
+            try (ResultSet rows = select.executeQuery()) {
+                while (rows.next()) {
+                    if (!active.contains(rows.getString(1))) stale.add(rows.getString(1));
+                }
+            }
+        }
+        if (stale.isEmpty()) return;
+        try (PreparedStatement update = local.prepareStatement(
+                "UPDATE " + table + " SET revoked_at = ? WHERE id = ?")) {
+            for (String id : stale) {
+                update.setLong(1, System.currentTimeMillis());
+                update.setString(2, id);
+                update.executeUpdate();
+            }
+        }
+    }
+
     private static void copy(Connection source, Connection target, String table, String where,
                              String parameter) throws SQLException {
+        copy(source, target, Dialect.MARIADB, table, where, parameter);
+    }
+
+    /** Copies rows between two backends without knowing their columns: it asks the ResultSet. */
+    private static void copy(Connection source, Connection target, Dialect targetDialect, String table,
+                             String where, String parameter) throws SQLException {
         try (PreparedStatement select = source.prepareStatement(
                 "SELECT * FROM " + table + " WHERE " + where)) {
-            select.setString(1, parameter);
+            if (parameter != null) select.setString(1, parameter);
             try (ResultSet rows = select.executeQuery()) {
                 ResultSetMetaData meta = rows.getMetaData();
                 int columns = meta.getColumnCount();
                 String names = String.join(", ", columnNames(meta));
                 String placeholders = String.join(", ", java.util.Collections.nCopies(columns, "?"));
-                String insert = Dialect.MARIADB.insertIgnorePrefix()
+                String insert = targetDialect.insertIgnorePrefix()
                         + table + " (" + names + ") VALUES (" + placeholders + ")";
 
                 try (PreparedStatement write = target.prepareStatement(insert)) {

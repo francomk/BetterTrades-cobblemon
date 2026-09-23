@@ -1,6 +1,8 @@
 package com.bettertrades.trade;
 
 import com.cobblemon.mod.common.Cobblemon;
+import com.cobblemon.mod.common.api.Priority;
+import com.cobblemon.mod.common.api.events.CobblemonEvents;
 import com.cobblemon.mod.common.battles.BattleRegistry;
 import com.bettertrades.BetterTrades;
 import com.bettertrades.config.BetterTradesConfig;
@@ -56,6 +58,19 @@ public final class TradeSessions {
         });
 
         ServerTickEvents.END_SERVER_TICK.register(TradeSessions::tick);
+
+        // A Pokemon on offer cannot be released. Cobblemon's release handler checks the position
+        // and the UUID, not which screen is open, so a modified client can release it with the
+        // trade window up, and a normal one can after Esc during COMMITTING. The fingerprint check
+        // before the move catches it anyway; this stops it before it happens.
+        CobblemonEvents.POKEMON_RELEASED_EVENT_PRE.subscribe(Priority.HIGHEST, event -> {
+            TradeSession session = BY_PLAYER.get(event.getPlayer().getUuid());
+            if (session == null || !session.offers(event.getPlayer().getUuid(), event.getPokemon().getUuid())) {
+                return;
+            }
+            event.cancel();
+            Texts.denied(event.getPlayer(), "chat.error.pokemon_on_offer");
+        });
     }
 
     /**
@@ -107,6 +122,17 @@ public final class TradeSessions {
             Texts.denied(a, "chat.error.busy");
             Texts.denied(b, "chat.error.busy");
             return null;
+        }
+        // The periodic check would cancel a trade opened mid-battle a second later: better not to
+        // open it at all.
+        if (BetterTradesConfig.get().trade.cancelOnBattle) {
+            for (ServerPlayerEntity player : List.of(a, b)) {
+                if (BattleRegistry.getBattleByParticipatingPlayer(player) != null) {
+                    Texts.denied(a, "chat.error.in_battle", player.getGameProfile().getName());
+                    Texts.denied(b, "chat.error.in_battle", player.getGameProfile().getName());
+                    return null;
+                }
+            }
         }
         // The screen is made of models and fonts from the pack: without it the player would see an
         // empty window and click blindly.

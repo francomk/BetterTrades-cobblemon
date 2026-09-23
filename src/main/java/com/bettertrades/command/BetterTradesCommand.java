@@ -17,7 +17,9 @@ import com.bettertrades.trade.PokemonFingerprint;
 import com.bettertrades.trade.TradeSession;
 import com.bettertrades.trade.TradeSessions;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.EntityArgumentType;
+import net.minecraft.command.argument.IdentifierArgumentType;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.registry.Registries;
@@ -25,7 +27,6 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.text.HoverEvent;
 import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -197,13 +198,18 @@ public final class BetterTradesCommand {
         return CommandManager.literal("blacklist")
                 .then(CommandManager.literal("add")
                         .then(CommandManager.literal("item")
-                                .then(CommandManager.argument("item", StringArgumentType.string())
+                                // An identifier argument, not a string one: a string argument
+                                // stops at ':' unless quoted, so "minecraft:diamond" was refused and
+                                // the only form that worked was the bare path.
+                                .then(CommandManager.argument("item", IdentifierArgumentType.identifier())
+                                        .suggests((context, builder) ->
+                                                CommandSource.suggestIdentifiers(Registries.ITEM.getIds(), builder))
                                         .executes(context -> addItem(context, ""))
                                         .then(CommandManager.argument("reason", StringArgumentType.greedyString())
                                                 .executes(context -> addItem(context,
                                                         StringArgumentType.getString(context, "reason"))))))
                         .then(CommandManager.literal("pokemon")
-                                .then(CommandManager.argument("species", StringArgumentType.string())
+                                .then(CommandManager.argument("species", IdentifierArgumentType.identifier())
                                         .executes(context -> addPokemon(context, null, Set.of(), ""))
                                         .then(CommandManager.argument("form", StringArgumentType.string())
                                                 .executes(context -> addPokemon(context,
@@ -234,12 +240,13 @@ public final class BetterTradesCommand {
     }
 
     private static int addItem(CommandContext<ServerCommandSource> context, String reason) {
-        String itemId = StringArgumentType.getString(context, "item");
+        String typed = IdentifierArgumentType.getIdentifier(context, "item").toString();
         // Without this check a wrong identifier created a row in item and a rule that would never
-        // have blocked anything, and the command answered "added".
-        Identifier parsed = Identifier.tryParse(itemId);
-        if (parsed == null || !Registries.ITEM.containsId(parsed)) {
-            info(context, "command.blacklist.item_unknown", itemId);
+        // have blocked anything, and the command answered "added". The rule is written with the
+        // canonical id, the one the check compares against.
+        String itemId = Blacklist.itemId(typed);
+        if (itemId == null) {
+            info(context, "command.blacklist.item_unknown", typed);
             return 0;
         }
         String author = context.getSource().getName();
@@ -250,7 +257,14 @@ public final class BetterTradesCommand {
 
     private static int addPokemon(CommandContext<ServerCommandSource> context, String form,
                                   Set<String> aspects, String reason) {
-        String species = StringArgumentType.getString(context, "species");
+        String typed = IdentifierArgumentType.getIdentifier(context, "species").toString();
+        // Same as items: a species that does not exist, or one stored without its namespace, made a
+        // rule that answered "added" and blocked nothing.
+        String species = Blacklist.speciesId(typed);
+        if (species == null) {
+            info(context, "command.blacklist.species_unknown", typed);
+            return 0;
+        }
         String author = context.getSource().getName();
         String described = species
                 + (form == null ? "" : " " + form)

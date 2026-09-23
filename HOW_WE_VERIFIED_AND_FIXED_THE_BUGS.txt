@@ -5,11 +5,11 @@ Project : BetterTrades 0.1.0-mc1.21.1
 Stack   : Fabric loader 0.16.5 / Fabric API 0.104.0 / Yarn 1.21.1+build.3 / Java 21
 Depends : Cobblemon 1.7.3, Polymer 0.9.15, sgui 1.6.1, SQLite 3.46.1.3,
           MariaDB 3.4.1, LuckPerms 5.4 (optional), Impactor 5.3.5 (optional)
-Scope   : the whole mod - 44 .java files, schema.sql, fabric.mod.json,
+Scope   : the whole mod - 47 .java files, schema.sql, fabric.mod.json,
           bettertrades.mixins.json, the test suite
 
 This is the record of the audit BetterTrades went through before release, and of
-what was changed because of it. 56 findings, all closed. It is published for two
+what was changed because of it. 70 findings, all closed. It is published for two
 reasons.
 
 The first: a trading mod moves other people's items, Pokemon and money. If it has
@@ -33,7 +33,8 @@ PART 4   Regressions caused by our own fixes, found and closed
 PART 5   Round 2 - 12 findings on the corrected code
 PART 6   Round 3 - 23 findings, mostly on the paths the first two rounds had
          only half covered
-PART 7   What is still not verified
+PART 7   Round 4 - 14 findings on the release candidate
+PART 8   What is still not verified
 
 Severities are the ones used during the audit:
 
@@ -81,11 +82,11 @@ What the findings rest on:
     future is already complete - the mechanism behind finding 5.2, the one that
     can make a refund never run at all.
 
-  * ./gradlew build on every round. The suite grew from 1 test to 15 as the
+  * ./gradlew build on every round. The suite grew from 1 test to 17 as the
     fixes landed.
 
 What was NOT used: no two-client play session, no debugger session on a live
-trade, no heap profiling. See PART 7.
+trade, no heap profiling. See PART 8.
 
 
 ================================================================================
@@ -939,7 +940,241 @@ they disagree, a WARN says which of the two situations you are in.
 
 
 ================================================================================
-PART 7 - WHAT IS STILL NOT VERIFIED
+PART 7 - ROUND 4: 14 FINDINGS ON THE RELEASE CANDIDATE
+================================================================================
+
+A fresh read-only pass over the code that was about to ship, including a
+money-input change that had not been committed yet. It re-checked Cobblemon
+1.7.3's release and trade handlers in bytecode, sgui 1.6.1's anvil and click
+handling in source, and ran Brigadier 1.3.10's string parser on real input
+outside the game. The biggest outcome is structural: the order in which a
+trade commits was changed (7.1 and 7.5).
+
+
+--------------------------------------------------------------------------------
+7.1 [HIGH] A crash right after an offer returned the item twice
+--------------------------------------------------------------------------------
+Offering an item took it out of the inventory in memory and committed its
+escrow row to disk at once. The player's file, though, is only written by
+vanilla's autosave, at logout or on save-all. Between the two, the disk held two
+copies of the item: one in the old player file, one in the HELD escrow row. A
+server process that died without a clean stop - crash, kill -9, out of memory,
+the watchdog on a stuck tick - brought the old file back, and the login return
+handed over the escrow row as well.
+
+Starting quantity 64, final quantity 128. Repeatable on any stack by anyone who
+knows how to crash the server, up to eight stacks per offer. The same gap existed
+at the end of a trade: money is durable the moment the economy says so, items
+and Pokemon only at the next save.
+
+FIXED - the player's state is now written on demand, through two accessor mixins
+(PlayerManager.savePlayerData, which is protected, and Cobblemon's store
+factories, which are private). The player file is saved BEFORE the escrow row is
+written, with the item already out of the inventory, so a crash in between can
+lose the item but never duplicate it - the same trade 6.1 and 6.18 made. Item
+returns save the recipient right after delivery; a completed trade saves both
+players' inventory, party and PC.
+
+KNOWN LIMIT: a millisecond window remains between the save and the commit,
+turned the lossy way. Cobblemon writes its store files on its own executor, so
+the Pokemon save is started, not waited for. With a database-backed Cobblemon
+store the Pokemon save is left to Cobblemon.
+
+
+--------------------------------------------------------------------------------
+7.2 [MEDIUM] Containers and held items slipped past the blacklist
+--------------------------------------------------------------------------------
+The item check compared only the id of the outermost stack. A shulker box or a
+bundle full of a blacklisted item went through, and so did an allowed Pokemon
+holding a blacklisted item. The second check at commit used the same function,
+and the history recorded only the shulker or the Pokemon.
+
+FIXED - the check walks the CONTAINER and BUNDLE_CONTENTS components
+recursively, up to 16 levels; deeper than that the item is refused as
+uncheckable. The Pokemon check also runs the item rules on the held item.
+
+KNOWN LIMIT: backpacks from other mods that keep their contents in components
+of their own are not opened.
+
+
+--------------------------------------------------------------------------------
+7.3 [MEDIUM] Blacklist rules added the natural way blocked nothing
+--------------------------------------------------------------------------------
+The item and species arguments were Brigadier strings, which stop at ':' unless
+quoted. The only unquoted form that worked was the bare path - "diamond" - and
+that was validated in its normalised form but stored raw. The check compares
+against "minecraft:diamond", so the rule never matched. Species were not
+validated at all: "pikachu" was stored as typed and compared against
+"cobblemon:pikachu", case-sensitively. The command answered "added", the list
+showed the rule, and the thing stayed tradeable. The API wrote without any
+validation, with the same effect.
+
+Reproduced outside the game with Brigadier 1.3.10: "minecraft:diamond" parses as
+"minecraft" and the command is refused; only the quoted form reaches the handler.
+
+FIXED - both arguments are identifier arguments, so "minecraft:diamond" works
+unquoted, with item suggestions. Every write path, command and API, stores the
+canonical id: lower case, with its namespace, and a bare or "minecraft:" species
+is looked up under "cobblemon:". An unknown item or species is refused. Rules
+stored in the old form are normalised when loaded, so they start working without
+being re-added.
+
+
+--------------------------------------------------------------------------------
+7.4 [MEDIUM] A Pokemon released while the payment was in flight
+--------------------------------------------------------------------------------
+Pokemon were re-checked before the payment and never after it. The payment can
+take seconds, and in that time the offering player could release the Pokemon -
+Cobblemon's release handler checks the slot and the UUID, not which screen is
+open, so a modified client can do it with the trade window up - or take its held
+item off. The buyer paid, and received nothing or something else. No refund:
+that path only covered cancels and disconnects.
+
+FIXED - twice over. A final check runs at the instant the Pokemon move, after
+the escrow close and after the payment: queued cancel, disconnect, Pokemon
+fingerprint, battle. If it fails after the payment, the money is refunded and
+the items go back. And a Pokemon on offer can no longer be released at all:
+BetterTrades cancels Cobblemon's release event for it, which the handler honours
+(checked in bytecode - a cancelled event puts the Pokemon back in its slot).
+
+
+--------------------------------------------------------------------------------
+7.5 [MEDIUM] A failed escrow close came after everything irreversible
+--------------------------------------------------------------------------------
+Money moved first, then the escrow rows were closed asynchronously while the
+Pokemon moved in the same tick. If that close failed - SQLite busy past its
+timeout, a full disk - the rows stayed HELD in the name of whoever had offered
+the items, and went back to them at the next login. One side ended up with its
+items back AND the other side's money or Pokemon. The history said the trade had
+completed in full.
+
+FIXED - the commit order is inverted. The escrow rows are closed as CONSUMED
+first, before any money and any Pokemon move. A failed close cancels a trade in
+which nothing has moved yet. Anything that stops the trade after the close - a
+refused payment, the final check of 7.4, the watchdog - hands the claimed items
+straight back to their owners and relabels the rows RETURNED. The final delivery
+no longer has an asynchronous step in it.
+
+
+--------------------------------------------------------------------------------
+7.6 [MEDIUM] The money-screen spam guard was reset by reopening the screen
+--------------------------------------------------------------------------------
+The fix for 6.8 was a flag on the screen instance, and every press of the money
+button builds a new screen. Confirm, back, money, confirm queued a new balance
+read on every loop, which is exactly what 6.8 was meant to stop.
+
+FIXED - the guard is per player, in a set that outlives the screen, and is
+cleared at server stop.
+
+
+--------------------------------------------------------------------------------
+7.7 [LOW] Starting with MariaDB down meant starting with an almost empty blacklist
+--------------------------------------------------------------------------------
+The fallback guard from 2.8 kept the cache only when it was not empty. At
+startup it always is, so a server that came up with MariaDB unreachable loaded
+SQLite's rules - only those born in some earlier fallback, because replay only
+copies towards MariaDB. Everything blacklisted there was tradeable until MariaDB
+came back, and the list command showed the short list as if it were the real one.
+
+FIXED - "never loaded from MariaDB" and "no rules" are now told apart. And every
+read from MariaDB copies the active rules into the local SQLite file, carrying
+revocations too (except rules still waiting to be replayed, which MariaDB has not
+seen yet). A start in fallback now reads a copy as recent as the last time
+MariaDB answered, and logs a WARN saying so. Covered by two tests.
+
+
+--------------------------------------------------------------------------------
+7.8 [LOW] Battles were only noticed once a second
+--------------------------------------------------------------------------------
+The battle check ran in the periodic check, every 20 ticks. A battle started in
+the last tick of the countdown was not seen, and a Pokemon could change owner in
+the middle of it. Opening a trade did not look either.
+
+FIXED - with cancelOnBattle on, a trade is not opened when either player is in a
+battle, and commit checks again, both at the countdown's end and at the instant
+the Pokemon move.
+
+
+--------------------------------------------------------------------------------
+7.9 [LOW] One Pokemon counted as many trades
+--------------------------------------------------------------------------------
+To fit Cobblemon's one-for-one events, the shorter side wrapped around. One
+Pokemon against three produced three TRADE_EVENT_POSTs for it and three trade
+evolution attempts, each against a different counterpart. Anything counting
+trades - quests, statistics, rewards - counted three.
+
+FIXED - each Pokemon gets exactly one evolution attempt, against the Pokemon at
+the same position on the other side. TRADE_EVENT_POST uses position-by-position
+pairs without wrapping. The pre-trade veto keeps wrapping, because a listener
+has to see every Pokemon to forbid it, and being asked twice is harmless there.
+
+KNOWN LIMIT: the extra Pokemon on the longer side get no TRADE_EVENT_POST - the
+same limit as a Pokemon traded for items only (6.5).
+
+
+--------------------------------------------------------------------------------
+7.10 [LOW] The API's post-trade event described the plan, not the outcome
+--------------------------------------------------------------------------------
+Listeners got the same view as before the commit. A Pokemon sent back because
+the other store was full was still listed as traded; an evolved one kept its old
+species. The database history was right, so the API and the database disagreed.
+
+FIXED - the post event is built from what really changed hands: items handed
+over, Pokemon that arrived, with their species after evolution, and the money.
+
+
+--------------------------------------------------------------------------------
+7.11 [LOW] A late balance read reopened a closed trade
+--------------------------------------------------------------------------------
+The money screen's balance callback reopened the trade screen without checking
+whether the trade still existed. A cancel during the read produced a ghost window
+with the old offers on it.
+
+FIXED - the callback resolves the player again and does nothing if the session is
+closed or the player has left.
+
+
+--------------------------------------------------------------------------------
+7.12 [LOW] Replay published half entries, and dropped name history
+--------------------------------------------------------------------------------
+Replay commits after each entry inside one transaction. An entry that failed
+halfway - after the trade rows, before the items - was not rolled back, so the
+next entry's commit published it: MariaDB showed a trade without items or
+Pokemon. Separately, the player-name history written during the fallback was
+never copied, and the current name on MariaDB stayed the old one.
+
+FIXED - a failed entry rolls back before the next one starts. The replay copies
+the participants' name history and brings their current name across.
+
+
+--------------------------------------------------------------------------------
+7.13 [LOW] Confirming an empty amount withdrew the money offer
+--------------------------------------------------------------------------------
+The uncommitted money-input change started the anvil empty instead of with the
+current amount, and an empty field parsed as zero. Opening the anvil to look at
+the amount and confirming removed the offer and cleared both confirmations.
+
+FIXED - an empty field means "leave it as it is": confirm goes back without
+touching the offer, and the button shows the amount already offered. Typing 0 is
+how the offer is removed, and the hint on the input says so.
+
+
+--------------------------------------------------------------------------------
+7.14 [INFO] The API could not see money
+--------------------------------------------------------------------------------
+TradeView and the pre-commit view carried items and Pokemon, not money, and the
+history queries never read trade_money. The pre-commit veto - the point where
+other mods are meant to stop a trade - was blind to its economic side.
+
+FIXED - both views carry a MoneyView per player: what they offered and what
+really moved, signed. The history queries read it from the database.
+
+CONTRACT NOTE FOR INTEGRATORS: TradeView and TradeView.Pending gained a component,
+so their canonical constructors changed. The existing accessors did not.
+
+
+================================================================================
+PART 8 - WHAT IS STILL NOT VERIFIED
 ================================================================================
 
 This is the honest boundary of the work. None of the following is a known
@@ -981,8 +1216,15 @@ defect; all of it is something nobody has watched happen.
     rendering is not.
 
   * The unit tests cover SQL and pure logic: the schema, escrow state
-    transitions, the migration, column truncation. 15 tests. They do not cover the
-    Minecraft path, which is the part that needs a server and two players.
+    transitions, the migration, column truncation, the local copy of the
+    blacklist. 17 tests. They do not cover the Minecraft path, which is the part
+    that needs a server and two players.
+
+  * The round 4 fixes were built and unit-tested, not played. In particular the
+    new commit order (escrow closed before the payment), the on-demand player
+    saves and the release block have been checked against the dependencies'
+    bytecode and sources, not watched on a live trade. Cobblemon is a compile-only
+    dependency here, so the development server does not load it.
 
 If you run BetterTrades on a production server and find something this audit
 missed, tell us: https://discord.gg/pQPWr7vfHu. A reproduction with item counts

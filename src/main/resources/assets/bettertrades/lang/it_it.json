@@ -87,8 +87,7 @@
   "gui.picker.lore.untradeable": "&cNon si puo' scambiare",
   "gui.money.plaque": "Offri soldi:",
   "gui.money.panel.title": "&6SOLDI",
-  "gui.money.input": "&6Scrivi l'importo",
-  "gui.money.input.lore": "&7Solo numeri interi. 0 toglie l'offerta.",
+  "gui.money.input.lore": "&7Solo numeri interi. 0 toglie l'offerta, vuoto la lascia com'e'.",
   "gui.money.confirm": "&aOffri {0}",
   "gui.money.confirm.lore": "&7Clicca per confermare l'importo.",
   "gui.money.back": "&cIndietro",
@@ -146,5 +145,10 @@
   "chat.error.inventory_full": "&cIl tuo inventario non puo' contenere quello che stai per ricevere. Libera spazio.",
   "chat.error.pokemon_moved": "&cConferma azzerata: un Pokemon offerto da {0} e' cambiato.",
   "chat.error.balance_gone": "&cConferma azzerata: {0} non ha piu' i soldi che aveva offerto.",
-  "chat.error.no_pack": "&cPer scambiare serve il resource pack del server, e {0} non l'ha accettato."
+  "chat.error.no_pack": "&cPer scambiare serve il resource pack del server, e {0} non l'ha accettato.",
+  "chat.error.in_battle": "&cNiente scambi durante una battaglia: {0} ne ha una in corso.",
+  "chat.error.pokemon_on_offer": "&cQuel Pokemon e' in offerta in uno scambio: toglilo prima dall'offerta.",
+  "chat.error.item_too_nested": "contenitori annidati troppo in profondita' per essere controllati",
+  "chat.staff.escrow_close_stuck": "&4Scambio {0} ({1} / {2}) si e' bloccato durante la chiusura dell'escrow ed e' stato chiuso d'ufficio. Non e' stato pagato niente; gli item tornano ai proprietari.",
+  "command.blacklist.species_unknown": "&cNessuna specie e' registrata come &f{0}&c."
 }

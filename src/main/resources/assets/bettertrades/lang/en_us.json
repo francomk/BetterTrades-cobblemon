@@ -87,8 +87,7 @@
   "gui.picker.lore.untradeable": "&cCannot be traded",
   "gui.money.plaque": "Offer money:",
   "gui.money.panel.title": "&6MONEY",
-  "gui.money.input": "&6Type the amount",
-  "gui.money.input.lore": "&7Whole numbers only. 0 removes the offer.",
+  "gui.money.input.lore": "&7Whole numbers only. 0 removes the offer, empty keeps it.",
   "gui.money.confirm": "&aOffer {0}",
   "gui.money.confirm.lore": "&7Click to confirm the amount.",
   "gui.money.back": "&cBack",
@@ -146,5 +145,10 @@
   "chat.error.inventory_full": "&cYour inventory cannot hold what you are about to receive. Free some space.",
   "chat.error.pokemon_moved": "&cConfirmation cleared: a Pokemon offered by {0} changed.",
   "chat.error.balance_gone": "&cConfirmation cleared: {0} no longer has the money on offer.",
-  "chat.error.no_pack": "&cTrading needs the server resource pack, and {0} has not accepted it."
+  "chat.error.no_pack": "&cTrading needs the server resource pack, and {0} has not accepted it.",
+  "chat.error.in_battle": "&cNo trading during a battle: {0} is in one.",
+  "chat.error.pokemon_on_offer": "&cThat Pokemon is on offer in a trade: take it out of the offer first.",
+  "chat.error.item_too_nested": "containers nested too deeply to be checked",
+  "chat.staff.escrow_close_stuck": "&4Trade {0} ({1} / {2}) hung while closing escrow and was force-closed. Nothing was paid; the items go back to their owners.",
+  "command.blacklist.species_unknown": "&cNo species is registered as &f{0}&c."
 }

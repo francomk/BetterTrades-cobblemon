@@ -82,6 +82,11 @@ public final class Database {
         return backend;
     }
 
+    /** The SQLite fallback file, null before {@link #open}. */
+    public static Path localFile() {
+        return sqliteFile;
+    }
+
     /** False when not even SQLite writes: trades must not start. */
     public static boolean usable() {
         return backend != Backend.NONE;

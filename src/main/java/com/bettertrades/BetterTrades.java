@@ -12,6 +12,7 @@ import com.bettertrades.db.EscrowMigration;
 import com.bettertrades.db.Replay;
 import com.bettertrades.economy.MoneyService;
 import com.bettertrades.gui.Icons;
+import com.bettertrades.gui.MoneyInputGui;
 import com.bettertrades.lang.Lang;
 import com.bettertrades.trade.TradeSessions;
 import net.fabricmc.api.ModInitializer;
@@ -81,6 +82,8 @@ public final class BetterTrades implements ModInitializer {
             // escrow and come back at the first login of the next world.
             TradeSessions.shutdown();
             TradeEvents.clear();
+            Blacklist.clear();
+            MoneyInputGui.clearReads();
             ReadOnlyDb.close();
             Database.close();
             EscrowDb.close();

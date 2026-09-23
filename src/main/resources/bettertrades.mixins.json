@@ -3,7 +3,7 @@
   "minVersion": "0.8",
   "package": "com.bettertrades.mixin",
   "compatibilityLevel": "JAVA_21",
-  "mixins": ["TradeManagerMixin"],
+  "mixins": ["PlayerManagerAccessor", "PokemonStoreManagerAccessor", "TradeManagerMixin"],
   "injectors": {
     "defaultRequire": 1
   }

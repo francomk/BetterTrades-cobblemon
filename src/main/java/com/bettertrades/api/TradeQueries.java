@@ -164,6 +164,20 @@ final class TradeQueries {
             }
         }
 
+        Map<String, List<TradeView.MoneyView>> money = new HashMap<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT trade_id, player_uuid, amount, transferred, currency FROM trade_money"
+                        + " WHERE trade_id IN (" + placeholders + ")")) {
+            bind(statement, tradeIds);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    money.computeIfAbsent(rows.getString(1), key -> new ArrayList<>())
+                            .add(new TradeView.MoneyView(UUID.fromString(rows.getString(2)),
+                                    rows.getLong(3), rows.getLong(4), rows.getString(5)));
+                }
+            }
+        }
+
         Map<String, TradeView> byId = new LinkedHashMap<>();
         try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT id, started_at, completed_at, world FROM trade WHERE id IN (" + placeholders
@@ -177,7 +191,8 @@ final class TradeQueries {
                             players.size() > 0 ? players.get(0) : null,
                             players.size() > 1 ? players.get(1) : null,
                             List.copyOf(items.getOrDefault(id, List.of())),
-                            List.copyOf(pokemon.getOrDefault(id, List.of()))));
+                            List.copyOf(pokemon.getOrDefault(id, List.of())),
+                            List.copyOf(money.getOrDefault(id, List.of()))));
                 }
             }
         }
