@@ -108,8 +108,13 @@ public final class EscrowService {
      * really moved. Nothing is delivered here: the session does that with {@link #deliver} once
      * it knows the rest of the trade can still go through.
      */
-    public static CompletableFuture<List<String>> consume(List<String> escrowIds) {
-        return claim(escrowIds, CONSUMED);
+    public static CompletableFuture<List<String>> consume(String tradeId, List<String> escrowIds) {
+        // The journal row is born in the same transaction that closes the rows: a restart that
+        // finds CONSUMED rows always finds the decision that goes with them.
+        return EscrowDb.supply(connection -> {
+            TradeJournal.openIn(connection, tradeId);
+            return claimIn(connection, escrowIds, CONSUMED);
+        });
     }
 
     /**
@@ -144,33 +149,49 @@ public final class EscrowService {
     }
 
     /**
-     * Undoes a {@link #consume} whose trade did not go through after all: the items go back to
-     * whoever offered them, and the rows are relabelled RETURNED so the table tells the truth.
+     * Undoes a {@link #consume} whose trade did not go through after all: the rows go from CONSUMED
+     * to RETURNED and the journal to ABORTED in one transaction, and only the rows that transaction
+     * really moved are handed back to whoever offered them.
      *
-     * Delivery does not wait for the relabel. Both states are terminal, so a relabel that fails
-     * cannot bring the item back a second time; waiting on it would only risk losing the item when
-     * the database is the very thing that is failing.
+     * Relabel first, delivery after, like every other path. Delivering first and relabelling after
+     * left a window where the item was back in the inventory while the rows still said CONSUMED
+     * under an OPEN journal: the startup recovery reopens exactly those rows, and the item would
+     * come back a second time. If the transaction fails, nothing is delivered and the rows stay
+     * CONSUMED under an OPEN journal, which is what the next start gives back.
      */
     public static void restore(MinecraftServer server, String tradeId, List<Custody> toOwners) {
-        if (toOwners.isEmpty()) return;
-        deliver(server, tradeId, toOwners);
         List<String> ids = new ArrayList<>(toOwners.size());
         for (Custody item : toOwners) ids.add(item.escrowId());
-        EscrowDb.execute(connection -> {
+        EscrowDb.supply(connection -> {
+            // After the stop nobody is left to deliver to on the server thread: the rows stay as they
+            // are and the startup recovery hands them back.
+            if (com.bettertrades.trade.TradeSessions.stopped()) return List.<String>of();
+            List<String> moved = new ArrayList<>(ids.size());
             try (PreparedStatement update = connection.prepareStatement(
                     "UPDATE escrow SET state = '" + RETURNED + "', resolved_at = ? WHERE id = ? AND state = '"
                             + CONSUMED + "'")) {
                 for (String id : ids) {
                     update.setLong(1, System.currentTimeMillis());
                     update.setString(2, id);
-                    update.executeUpdate();
+                    if (update.executeUpdate() > 0) moved.add(id);
                 }
             }
-        }).exceptionally(error -> {
-            BetterTrades.LOGGER.warn("Trade {}: {} escrow rows given back but still labelled {}",
-                    tradeId, ids.size(), CONSUMED, error);
-            return null;
-        });
+            TradeJournal.abortedIn(connection, tradeId);
+            return moved;
+        }).whenComplete((moved, error) -> server.execute(() -> {
+            if (error != null) {
+                BetterTrades.LOGGER.error("Trade {}: {} escrow rows could not be given back ({}):"
+                        + " they stay CONSUMED and come back at the next restart", tradeId, ids.size(),
+                        RETURNED, error);
+                Texts.staff(server, "chat.staff.escrow_stuck", tradeId, ids.size());
+                return;
+            }
+            List<Custody> back = new ArrayList<>(moved.size());
+            for (Custody item : toOwners) {
+                if (moved.contains(item.escrowId())) back.add(item);
+            }
+            deliver(server, tradeId, back);
+        }));
     }
 
     /**
@@ -202,7 +223,7 @@ public final class EscrowService {
                 deliverable.add(item);
                 continue;
             }
-            BetterTrades.LOGGER.info("Trade {}: {} is not connected, escrow {} left HELD",
+            BetterTrades.LOGGER.info("Trade {}: {} is not connected or not alive, escrow {} left HELD",
                     tradeId, item.toName(), item.escrowId());
         }
         if (deliverable.isEmpty()) return;
@@ -252,33 +273,43 @@ public final class EscrowService {
      */
     private static CompletableFuture<List<String>> claim(List<String> escrowIds, String state) {
         if (escrowIds.isEmpty()) return CompletableFuture.completedFuture(List.of());
-        return EscrowDb.supply(connection -> {
-            List<String> claimed = new ArrayList<>(escrowIds.size());
-            try (PreparedStatement update = connection.prepareStatement(
-                    "UPDATE escrow SET state = ?, resolved_at = ? WHERE id = ? AND state = '" + HELD + "'")) {
-                for (String id : escrowIds) {
-                    update.setString(1, state);
-                    update.setLong(2, System.currentTimeMillis());
-                    update.setString(3, id);
-                    if (update.executeUpdate() > 0) {
-                        claimed.add(id);
-                        continue;
-                    }
-                    // Zero rows touched means that escrow had already been closed by another path:
-                    // here it is the lock that prevents the second delivery, and in the log it is the
-                    // symptom of two paths contending for the same row.
-                    BetterTrades.LOGGER.warn("Escrow {} already closed: {} not applied,"
-                            + " nothing delivered from this path", id, state);
-                }
-            }
-            return claimed;
-        });
+        return EscrowDb.supply(connection -> claimIn(connection, escrowIds, state));
     }
 
-    /** The player if they really are still connected, null otherwise. */
-    private static ServerPlayerEntity online(MinecraftServer server, UUID player) {
+    private static List<String> claimIn(Connection connection, List<String> escrowIds, String state)
+            throws SQLException {
+        List<String> claimed = new ArrayList<>(escrowIds.size());
+        try (PreparedStatement update = connection.prepareStatement(
+                "UPDATE escrow SET state = ?, resolved_at = ? WHERE id = ? AND state = '" + HELD + "'")) {
+            for (String id : escrowIds) {
+                update.setString(1, state);
+                update.setLong(2, System.currentTimeMillis());
+                update.setString(3, id);
+                if (update.executeUpdate() > 0) {
+                    claimed.add(id);
+                    continue;
+                }
+                // Zero rows touched means that escrow had already been closed by another path:
+                // here it is the lock that prevents the second delivery, and in the log it is the
+                // symptom of two paths contending for the same row.
+                BetterTrades.LOGGER.warn("Escrow {} already closed: {} not applied,"
+                        + " nothing delivered from this path", id, state);
+            }
+        }
+        return claimed;
+    }
+
+    /**
+     * The player if they can receive an item right now, null otherwise.
+     *
+     * Alive, not just connected. A player on the death screen is still in the PlayerManager and not
+     * removed, but the inventory they carry is the corpse's: the respawn builds a new player and,
+     * without keepInventory, copies nothing across. An item given there vanishes. Treated as absent,
+     * the row stays HELD and comes back at the respawn.
+     */
+    public static ServerPlayerEntity online(MinecraftServer server, UUID player) {
         ServerPlayerEntity found = server.getPlayerManager().getPlayer(player);
-        return found == null || found.isRemoved() ? null : found;
+        return found == null || found.isRemoved() || !found.isAlive() ? null : found;
     }
 
     /** Last resort: row already closed and the recipient gone, so a fresh escrow row is opened. */
@@ -301,7 +332,7 @@ public final class EscrowService {
     }
 
     /**
-     * At login: whatever was in escrow and never traded goes back to its owner.
+     * At login and at respawn: whatever was in escrow and never traded goes back to its owner.
      *
      * It goes through the same close-before-delivery as every other path, so two paths wanting the
      * same row - this one and a disconnect-cancel still queued - cannot both deliver it: only one

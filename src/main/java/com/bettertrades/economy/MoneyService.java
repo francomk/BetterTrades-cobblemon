@@ -69,11 +69,18 @@ public final class MoneyService {
     private static final BigDecimal LONG_MAX = BigDecimal.valueOf(Long.MAX_VALUE);
     private static final BigDecimal LONG_MIN = BigDecimal.valueOf(Long.MIN_VALUE);
 
-    private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "BetterTrades economy");
-        thread.setDaemon(true);
-        return thread;
-    });
+    /** How long the stop waits for deposits already queued: a refund cut off here is money lost. */
+    private static final long SHUTDOWN_WAIT_SECONDS = OPERATION_TIMEOUT_SECONDS + 10;
+
+    private static volatile ExecutorService worker = newWorker();
+
+    private static ExecutorService newWorker() {
+        return Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "BetterTrades economy");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
 
     private static volatile Mode mode = Mode.NONE;
 
@@ -84,6 +91,8 @@ public final class MoneyService {
      * initialisation: earlier it would say no.
      */
     public static CompletableFuture<Boolean> refreshAvailability() {
+        // A previous server in the same JVM (singleplayer, LAN) closed it on the way out.
+        if (worker.isShutdown()) worker = newWorker();
         return CompletableFuture.supplyAsync(() -> {
             if (!BetterTradesConfig.get().economy.enabled) {
                 mode = Mode.NONE;
@@ -102,7 +111,25 @@ public final class MoneyService {
                 BetterTrades.LOGGER.info("Impactor economy connected, currency '{}'", currencyKey());
             }
             return mode != Mode.NONE;
-        }, WORKER);
+        }, worker);
+    }
+
+    /**
+     * Server stop: lets the queued operations finish instead of dying with the JVM.
+     *
+     * The thread is a daemon, so without this a refund queued by the last trades of the session was
+     * cut off mid-queue by the exit: the payer's money withdrawn and never given back.
+     */
+    public static void close() {
+        worker.shutdown();
+        try {
+            if (!worker.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
+                BetterTrades.LOGGER.error("The economy thread did not finish its queue in {}s: the"
+                        + " trade journal settles what was left at the next start", SHUTDOWN_WAIT_SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** The last known availability, without touching Impactor: the GUI asks on every redraw. */
@@ -134,7 +161,7 @@ public final class MoneyService {
      * The balance as a long, without the silent truncation of {@link java.math.BigDecimal#longValue()}.
      *
      * longValue() does not throw on overflow: it returns the low 64 bits, so a huge balance becomes
-     * some arbitrary number, possibly negative. The real transfer does not come through here - pay()
+     * some arbitrary number, possibly negative. The real withdraw does not come through here - take()
      * compares in BigDecimal - so no money is created or lost, but the upstream checks do, and with a
      * wrong balance they refuse a valid offer while showing a nonsensical figure, or drop the
      * confirmation of a trade that could have gone through. Saturating is the only answer those
@@ -154,29 +181,173 @@ public final class MoneyService {
     }
 
     /**
-     * Moves {@code amount} from one player to the other, with the provider's atomic operation.
+     * Takes {@code amount} from the payer and keeps it out of everyone's hands until the trade
+     * decides: see {@link #release}.
      *
-     * The outcome is false when the balance is no longer enough as well: between the offer and the
-     * confirmation the player may have spent elsewhere, and in that case the caller MUST cancel the
-     * trade.
+     * An atomic transfer straight to the payee looked safer and was not. When the trade had to stop
+     * after the payment - a Pokemon renamed or taken off the offer while the payment was in flight -
+     * the money had to come back with a second transfer from the payee, and a payee who had already
+     * spent it made that transfer fail: the payer lost the money, the payee kept it and everything
+     * they had offered. Held here, a refund is a deposit, and a deposit does not depend on anyone's
+     * balance.
      *
-     * Whoever cancels on the expiry of {@link Operation#awaited()} must also watch
-     * {@link Operation#settled()}: the transfer is still running, and if it goes through afterwards
-     * the money has moved for a trade that no longer exists.
+     * The journal is written before the withdraw and after it, on this thread, so that a crash
+     * anywhere in between leaves a row that says how far it got.
+     *
+     * @return true when the money is held; false when it was refused and nothing moved
      */
-    public static Operation<Boolean> pay(UUID from, UUID to, long amount) {
-        return onWorker("Transfer of " + amount + " from " + from + " to " + to, () -> {
-            if (amount == 0) return true;
+    public static Operation<Boolean> take(String tradeId, UUID payer, UUID payee, long amount) {
+        return onWorker("Hold of " + amount + " from " + payer + " for trade " + tradeId, () -> {
             if (mode == Mode.NONE) return false;
-
-            Account source = account(from);
-            Account destination = account(to);
-            if (source == null || destination == null) return false;
-
+            Account source = account(payer);
+            if (source == null) return false;
             BigDecimal value = BigDecimal.valueOf(amount);
             if (source.balance().compareTo(value) < 0) return false;
-            return source.transfer(destination, value).successful();
+
+            // No journal, no withdraw: money taken without a row describing it is money that only
+            // this JVM remembers.
+            com.bettertrades.escrow.TradeJournal.moneyPending(tradeId, payer, payee, amount);
+            boolean taken = source.withdraw(value).successful();
+            try {
+                com.bettertrades.escrow.TradeJournal.money(tradeId, taken
+                        ? com.bettertrades.escrow.TradeJournal.MONEY_HELD
+                        : com.bettertrades.escrow.TradeJournal.MONEY_FAILED);
+            } catch (RuntimeException e) {
+                // The money is held all the same: the row stays PENDING and the next start reports
+                // it. Returning false here would leave the payer without the amount and the session
+                // convinced nothing was taken.
+                BetterTrades.LOGGER.error("Trade {}: hold of {} from {} is {}, but the journal did not"
+                        + " record it", tradeId, amount, payer, taken ? "done" : "refused", e);
+            }
+            return taken;
         });
+    }
+
+    /**
+     * Hands held money to whoever the trade decided: the payee when it went through, back to the
+     * payer when it did not.
+     *
+     * A deposit that is refused moved nothing and is retried once; a second refusal leaves the row
+     * in RETRY, which the next start tries again. A deposit that throws or hangs has an unknown
+     * outcome: the row stays in TO_PAYEE / TO_PAYER, which the next start reports and does NOT
+     * retry, because trying again could pay twice.
+     *
+     * @param onFailure run on the economy thread when the money did not arrive, to tell the staff
+     */
+    public static Operation<Boolean> release(String tradeId, UUID to, long amount, boolean toPayee,
+                                             Runnable onFailure) {
+        return onWorker("Release of " + amount + " to " + to + " for trade " + tradeId, () -> {
+            boolean done;
+            try {
+                done = deposit(tradeId, to, amount, toPayee);
+            } catch (Throwable failure) {
+                onFailure.run();
+                throw failure;
+            }
+            if (!done) onFailure.run();
+            return done;
+        });
+    }
+
+    /**
+     * At startup: settles the money of the trades a crash or a stop left in between.
+     * Called once Impactor is known to be there.
+     */
+    public static void recover() {
+        com.bettertrades.escrow.TradeJournal.openMoney().thenAccept(rows -> {
+            if (rows.isEmpty()) return;
+            onWorker("Trade journal money recovery", () -> {
+                for (com.bettertrades.escrow.TradeJournal.OpenMoney row : rows) {
+                    try {
+                        recoverOne(row);
+                    } catch (RuntimeException e) {
+                        BetterTrades.LOGGER.error("Trade {}: money recovery failed, state left at {}",
+                                row.tradeId(), row.moneyState(), e);
+                    }
+                }
+                return true;
+            });
+        }).exceptionally(error -> {
+            BetterTrades.LOGGER.error("The money recovery of the trade journal failed", error);
+            return null;
+        });
+    }
+
+    private static void recoverOne(com.bettertrades.escrow.TradeJournal.OpenMoney row) {
+        String state = row.moneyState();
+        if (com.bettertrades.escrow.TradeJournal.MONEY_PENDING.equals(state)
+                || com.bettertrades.escrow.TradeJournal.MONEY_TO_PAYEE.equals(state)
+                || com.bettertrades.escrow.TradeJournal.MONEY_TO_PAYER.equals(state)) {
+            com.bettertrades.escrow.TradeJournal.money(row.tradeId(),
+                    com.bettertrades.escrow.TradeJournal.MONEY_UNKNOWN);
+            BetterTrades.LOGGER.error("MONEY OF UNKNOWN OUTCOME trade={} amount={} payer={} payee={}"
+                            + " state={}: the operation was interrupted and may or may not have happened."
+                            + " Check both balances in the economy log and settle it by hand",
+                    row.tradeId(), row.amount(), row.payer(), row.payee(), state);
+            return;
+        }
+        boolean toPayee;
+        if (com.bettertrades.escrow.TradeJournal.MONEY_RETRY_PAYEE.equals(state)) {
+            toPayee = true;
+        } else if (com.bettertrades.escrow.TradeJournal.MONEY_RETRY_PAYER.equals(state)) {
+            toPayee = false;
+        } else {
+            // HELD: nobody has it. The trade's own state says who should.
+            String trade = row.state();
+            toPayee = com.bettertrades.escrow.TradeJournal.COMMITTED.equals(trade)
+                    || com.bettertrades.escrow.TradeJournal.DONE.equals(trade);
+        }
+        UUID to = toPayee ? row.payee() : row.payer();
+        if (deposit(row.tradeId(), to, row.amount(), toPayee)) {
+            BetterTrades.LOGGER.warn("Trade {}: held money {} settled at startup to the {} {}",
+                    row.tradeId(), row.amount(), toPayee ? "payee" : "payer", to);
+        } else {
+            BetterTrades.LOGGER.error("Trade {}: held money {} could not be settled at startup to the"
+                    + " {} {}: retried at the next start", row.tradeId(), row.amount(),
+                    toPayee ? "payee" : "payer", to);
+        }
+    }
+
+    /** Economy thread only. True when the money arrived. */
+    private static boolean deposit(String tradeId, UUID to, long amount, boolean toPayee) {
+        String sending = toPayee ? com.bettertrades.escrow.TradeJournal.MONEY_TO_PAYEE
+                : com.bettertrades.escrow.TradeJournal.MONEY_TO_PAYER;
+        String retry = toPayee ? com.bettertrades.escrow.TradeJournal.MONEY_RETRY_PAYEE
+                : com.bettertrades.escrow.TradeJournal.MONEY_RETRY_PAYER;
+        String arrived = toPayee ? com.bettertrades.escrow.TradeJournal.MONEY_PAID
+                : com.bettertrades.escrow.TradeJournal.MONEY_REFUNDED;
+        try {
+            com.bettertrades.escrow.TradeJournal.money(tradeId, sending);
+        } catch (RuntimeException e) {
+            // Without the row saying a deposit started, a crash after it would pay a second time at
+            // the next start. The money stays held and the next start settles it from the journal.
+            BetterTrades.LOGGER.error("Trade {}: journal not writable, deposit of {} to {} postponed"
+                    + " to the next start", tradeId, amount, to, e);
+            return false;
+        }
+        for (int attempt = 0; attempt < 2; attempt++) {
+            boolean done = false;
+            if (mode != Mode.NONE) {
+                Account account = account(to);
+                done = account != null && account.deposit(BigDecimal.valueOf(amount)).successful();
+            }
+            if (done) {
+                try {
+                    com.bettertrades.escrow.TradeJournal.money(tradeId, arrived);
+                } catch (RuntimeException e) {
+                    BetterTrades.LOGGER.error("Trade {}: {} deposited to {} but the journal still says {}:"
+                            + " the next start will report it as unknown", tradeId, amount, to, sending, e);
+                }
+                return true;
+            }
+        }
+        try {
+            com.bettertrades.escrow.TradeJournal.money(tradeId, retry);
+        } catch (RuntimeException e) {
+            BetterTrades.LOGGER.error("Trade {}: deposit of {} to {} refused and the journal not updated",
+                    tradeId, amount, to, e);
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- economy thread
@@ -213,7 +384,7 @@ public final class MoneyService {
         });
 
         try {
-            WORKER.execute(() -> {
+            worker.execute(() -> {
                 try {
                     settled.complete(body.call());
                 } catch (Throwable failure) {

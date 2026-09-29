@@ -22,6 +22,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -36,11 +37,29 @@ public final class TradeSessions {
 
     private static int tickCounter;
 
+    /**
+     * True from the moment the server starts stopping until the next start.
+     *
+     * Once MinecraftServer is stopped, server.execute no longer queues: it runs the task inline on
+     * whatever thread calls it - the escrow thread, the economy thread. A late escrow or money
+     * callback would then move items and Pokemon off the server thread while the worlds are being
+     * saved. From here on those callbacks do nothing, and the trade journal settles what they would
+     * have done at the next start.
+     */
+    private static volatile boolean stopped;
+
     private TradeSessions() {}
 
     public static void register() {
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
                 EscrowService.returnOpen(server, handler.getPlayer()));
+
+        // A player who died with items in escrow gets them here: while on the death screen they
+        // were not a valid recipient, and their rows stayed HELD.
+        net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents.AFTER_RESPAWN.register(
+                (oldPlayer, newPlayer, alive) -> {
+                    if (newPlayer.getServer() != null) EscrowService.returnOpen(newPlayer.getServer(), newPlayer);
+                });
 
         // Fabric fires DISCONNECT from two places: handleDisconnection, on the server thread, and
         // channelInactive, on Netty's event loop. On an abrupt disconnect the second one arrives
@@ -209,7 +228,55 @@ public final class TradeSessions {
      * to deliver to and leaves the escrow rows HELD, which is exactly what makes them come back at
      * the first login of the next world.
      */
+    public static boolean stopped() {
+        return stopped;
+    }
+
+    /** Server start: callbacks may act again. */
+    public static void start() {
+        stopped = false;
+    }
+
+    /**
+     * SERVER_STOPPING, on the server thread, with the players still connected.
+     *
+     * A session in COMMITTING has claimed escrow rows and maybe held money, and cancel() only queues
+     * behind that. Here those sessions are told to stop, and the server thread keeps running tasks
+     * until their callbacks have come back and given everything to the two players, who are still
+     * there to receive it. What does not come back in time is left to the trade journal.
+     */
+    public static void drain(MinecraftServer server) {
+        List<TradeSession> committing = new ArrayList<>();
+        for (TradeSession session : active()) {
+            if (session.stage() == TradeSession.Stage.COMMITTING) {
+                session.stopRequested();
+                committing.add(session);
+            }
+        }
+        if (!committing.isEmpty()) {
+            long deadline = System.currentTimeMillis()
+                    + (com.bettertrades.economy.MoneyService.operationTimeoutSeconds() + 5) * 1000;
+            server.runTasks(() -> System.currentTimeMillis() > deadline
+                    || committing.stream().noneMatch(s -> s.stage() == TradeSession.Stage.COMMITTING));
+            // The returns those sessions queued on the escrow thread come back through server.execute:
+            // a no-op queued behind them says when they have all been scheduled.
+            CompletableFuture<Void> barrier = EscrowDb.execute(connection -> {});
+            server.runTasks(() -> System.currentTimeMillis() > deadline || barrier.isDone());
+            while (server.runTask()) {
+                // Runs what the barrier let through.
+            }
+            for (TradeSession session : committing) {
+                if (session.stage() == TradeSession.Stage.COMMITTING) {
+                    BetterTrades.LOGGER.error("Trade {} still committing at shutdown: the trade journal"
+                            + " settles it at the next start", session.tradeId());
+                }
+            }
+        }
+        stopped = true;
+    }
+
     public static void shutdown() {
+        stopped = true;
         for (TradeSession session : active()) {
             try {
                 session.cancel(CancelReason.ADMIN, session.left().playerName());

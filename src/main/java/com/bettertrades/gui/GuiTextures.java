@@ -55,7 +55,8 @@ public final class GuiTextures {
     private static final char MONEY_PANEL = '';
     private static final int MONEY_PANEL_ADVANCE = 80;
     private static final char MONEY_INPUT = '';
-    private static final int MONEY_INPUT_ADVANCE = 136;
+    private static final int MONEY_INPUT_ADVANCE = 177;
+    private static final char PICKER_BACKGROUND = '';
 
     /** Spacing characters: 2^n to the right from E100, 2^n to the left from E120. */
     private static final char SPACE_RIGHT = '';
@@ -74,7 +75,7 @@ public final class GuiTextures {
 
     private GuiTextures() {}
 
-    /** A title for a chest screen, the trade screen's GENERIC_9X6. */
+    /** A title for a chest screen: the trade screen and the Pokemon picker, both GENERIC_9X6. */
     public static Composer composer() {
         return new Composer(CHEST_TITLE_X);
     }
@@ -145,6 +146,11 @@ public final class GuiTextures {
             return sprite(from(0), BACKGROUND, BACKGROUND_ADVANCE);
         }
 
+        /** The Pokemon picker's panel: same frame and grid as the trade screen's. */
+        public Composer pickerBackground() {
+            return sprite(from(0), PICKER_BACKGROUND, BACKGROUND_ADVANCE);
+        }
+
         /** The frame around a head slot: red while the player is still deciding, green once ready. */
         public Composer headFrame(int textureX, boolean ready) {
             return sprite(from(textureX), ready ? HEAD_READY : HEAD_IDLE, HEAD_ADVANCE);
@@ -158,7 +164,10 @@ public final class GuiTextures {
             return sprite(from(textureX), MONEY_PANEL, MONEY_PANEL_ADVANCE);
         }
 
-        /** The anvil's panel: its blue box sits under the anvil's own text field. */
+        /**
+         * The anvil's whole screen, player inventory included, drawn from the texture's left
+         * edge: its blue box sits under the anvil's own text field.
+         */
         public Composer moneyInput(int textureX) {
             return sprite(from(textureX), MONEY_INPUT, MONEY_INPUT_ADVANCE);
         }

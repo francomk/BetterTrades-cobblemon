@@ -64,7 +64,10 @@ public record PokemonFingerprint(UUID pokemonUuid, UUID owner, Location location
                 .append(pokemon.getAbility().getName()).append('|')
                 .append(pokemon.getCaughtBall().getName()).append('|')
                 .append(pokemon.getOriginalTrainer() == null ? "" : pokemon.getOriginalTrainer()).append('|')
-                .append(pokemon.getTradeable()).append('|');
+                .append(pokemon.getTradeable()).append('|')
+                // Sent to a pasture after being offered: the pasture would look for it in the PC of
+                // an owner it no longer has.
+                .append(pokemon.getTetheringId() != null).append('|');
 
         for (Stat stat : STATS) {
             canonical.append(stat.getIdentifier()).append(':')

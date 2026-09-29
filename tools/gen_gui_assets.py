@@ -46,7 +46,8 @@ MOCKUP = "Gui_BetterTrades copia.png"
 LOCKED = "trade copia/trade_locked_%s.png"
 WARN = "trade copia/Attenzione_invpieno_betterTrades.png"
 MONEY_PANEL = "Gui_latosinistro_OffertaSoldiBetterTrades copia.png"
-MONEY_INPUT = "Gui_OffriSoldi_AnvilGUI_BetterTrades copia.png"
+MONEY_INPUT = "REMASTER-GUI-bonifico_BetterTrades.png"
+PICKER = "Gui_BetterTrades_pokemonGUI copia.png"
 
 # --- what to cut out of the mockup ---------------------------------------------------
 
@@ -64,11 +65,26 @@ HEAD_GREEN = (0, 4, 24, 28)          # 24x24 inside trade_locked_other
 # The money panel, which slides out on the left of the trade screen.
 MONEY_PANEL_LABELS = ((3, 17, 76, 32), (3, 57, 76, 69))   # "Tu" / "Lui" rows, cleared
 
-# The anvil where the amount is typed. Its blue box sits under the anvil's own text field,
-# and the two buttons land on the anvil's second input slot and on its output slot.
-MONEY_INPUT_PLAQUE = (28, 3, 118, 14)   # inside of the title tab, words only
-MONEY_BACK = (35, 50, 54, 66)           # 19x16, on slot 1
-MONEY_CONFIRM = (92, 50, 111, 66)       # 19x16, on slot 2
+# The anvil where the amount is typed. The mockup is the whole anvil screen, player inventory
+# included: its grid lines up with the vanilla slots once the texture is drawn 8px above the
+# anvil's background origin. The blue box sits under the anvil's own text field, the coin
+# frame around the first input slot, and the two buttons land on the anvil's second input slot
+# and on its output slot.
+MONEY_INPUT_PLAQUE = (69, 3, 159, 14)   # inside of the title tab, words only
+MONEY_BACK = (76, 50, 95, 66)           # 19x16, on slot 1
+MONEY_CONFIRM = (133, 50, 152, 66)      # 19x16, on slot 2
+# The blue box and the stripes between the buttons. The anvil draws the typed text at y = 24,
+# which is 5px lower than the mockup's box allows, so this block moves down by MONEY_FIELD_DROP.
+# The buttons come down with it, which puts them exactly on their slots.
+MONEY_FIELD = (59, 18, 169, 66)
+MONEY_FIELD_DROP = 5
+
+# The Pokemon picker. Same frame and grid as the trade screen: rows 0-4 are slots, row 5
+# holds the buttons. The frame on slot 49 stays in the background, like the trade screen's,
+# because a real Poke Ball is drawn in it.
+PICKER_PREVIOUS = (8, 120, 25, 137)     # 17x17, on slot 45
+PICKER_BACK = (61, 120, 78, 137)        # 17x17, on slot 48
+PICKER_NEXT = (152, 120, 169, 137)      # 17x17, on slot 53
 
 # The middle button of the row keeps the mockup's frame in the background, because a real
 # Cobblemon Poke Ball is drawn in the slot on top of it.
@@ -96,12 +112,17 @@ BACKGROUND_ASCENT = 25               # texture top at y - 12
 HEAD_FRAME_ASCENT = -1               # frame top at y + 14
 WARN_PANEL_ASCENT = 13               # panel top at y
 MONEY_PANEL_ASCENT = 13              # level with the warning panel
-MONEY_INPUT_ASCENT = 16              # anvil: title line at y + 6, panel top at y - 3
+MONEY_INPUT_ASCENT = 21              # anvil: title line at y + 6, texture top at y - 8
 
 # Where an anvil button's art starts, relative to the slot it covers. The buttons in the
 # mockup are 57px apart and the slots 58, so each one gets its own offset.
-MONEY_BACK_AT = (-1, 0)
-MONEY_CONFIRM_AT = (-2, 0)
+MONEY_BACK_AT = (0, 0)
+MONEY_CONFIRM_AT = (-1, 0)
+
+# The picker's arrows, relative to their slots. The red one starts a pixel left of its slot.
+PICKER_PREVIOUS_AT = (0, 0)
+PICKER_BACK_AT = (-1, 0)
+PICKER_NEXT_AT = (0, 0)
 
 
 def load(name):
@@ -363,12 +384,26 @@ def main():
     # The anvil's words sit above the title line, like the trade screen's plaque, so they
     # are painted in.
     money_input = load(MONEY_INPUT)
+    money_input = money_input.crop(money_input.getbbox())
     back = money_input.crop(MONEY_BACK)
     confirm_money = money_input.crop(MONEY_CONFIRM)
     for box in (MONEY_INPUT_PLAQUE, MONEY_BACK, MONEY_CONFIRM):
         fill(money_input, box, PANEL)
+    field = money_input.crop(MONEY_FIELD)
+    fill(money_input, MONEY_FIELD, PANEL)
+    money_input.paste(field, (MONEY_FIELD[0], MONEY_FIELD[1] + MONEY_FIELD_DROP))
     font.centre(money_input, MONEY_INPUT_PLAQUE, say("gui.money.plaque"), PLAQUE_TEXT_COLOUR)
     save(money_input, "textures", "gui", "money_input.png")
+
+    # The picker reuses the trade screen's plaque box: its words are painted in too.
+    picker = load(PICKER)
+    previous_box = picker.crop(PICKER_PREVIOUS)
+    back_to_trade = picker.crop(PICKER_BACK)
+    next_box = picker.crop(PICKER_NEXT)
+    for box in (PLAQUE_TEXT, PICKER_PREVIOUS, PICKER_BACK, PICKER_NEXT):
+        fill(picker, box, PANEL)
+    font.centre(picker, PLAQUE_TEXT, say("gui.picker.plaque"), PLAQUE_TEXT_COLOUR)
+    save(picker, "textures", "gui", "picker_background.png")
 
     # ------------------------------------------------------------------ item art
     confirm = mockup.crop(CONFIRM)
@@ -389,12 +424,20 @@ def main():
     save(centred(dim(money, 0.45), ITEM_CANVAS), "textures", "item", "btn_money_off.png")
     save(in_slot(back, MONEY_BACK_AT), "textures", "item", "btn_money_back.png")
     save(in_slot(confirm_money, MONEY_CONFIRM_AT), "textures", "item", "btn_money_confirm.png")
+    # The anvil's first slot needs an item, since its name seeds the text field, but the coin
+    # frame is already in the background: the item draws nothing and keeps only its tooltip.
+    save(Image.new("RGBA", (ITEM_CANVAS, ITEM_CANVAS), CLEAR), "textures", "item", "btn_blank.png")
+    save(in_slot(previous_box, PICKER_PREVIOUS_AT), "textures", "item", "btn_box_previous.png")
+    save(in_slot(back_to_trade, PICKER_BACK_AT), "textures", "item", "btn_picker_back.png")
+    save(in_slot(next_box, PICKER_NEXT_AT), "textures", "item", "btn_box_next.png")
 
     # ------------------------------------------------------------------ item models
     canvases = {"btn_confirm": WIDE_CANVAS, "btn_confirm_done": WIDE_CANVAS,
                 "btn_trash": ITEM_CANVAS, "btn_money": ITEM_CANVAS,
                 "btn_money_off": ITEM_CANVAS, "btn_money_back": ITEM_CANVAS,
-                "btn_money_confirm": ITEM_CANVAS}
+                "btn_money_confirm": ITEM_CANVAS, "btn_blank": ITEM_CANVAS,
+                "btn_box_previous": ITEM_CANVAS,
+                "btn_picker_back": ITEM_CANVAS, "btn_box_next": ITEM_CANVAS}
     canvases.update({"btn_cancel_%d" % frame: WIDE_CANVAS for frame in range(1, 9)})
     for name, canvas in sorted(canvases.items()):
         scale = canvas / 16.0
@@ -412,6 +455,7 @@ def main():
         "": ("gui/warn_panel.png", warn, WARN_PANEL_ASCENT),
         "": ("gui/money_panel.png", money_panel, MONEY_PANEL_ASCENT),
         "": ("gui/money_input.png", money_input, MONEY_INPUT_ASCENT),
+        "": ("gui/picker_background.png", picker, BACKGROUND_ASCENT),
     }
     write_fonts(sprites, font.providers)
     save_json(font.advances(), "bettertrades", "font_widths.json", root=RESOURCES)

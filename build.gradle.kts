@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "com.bettertrades"
-version = "0.1.0-mc${property("minecraftVersion")}"
+version = "0.1.3-alpha-mc${property("minecraftVersion")}"
 
 java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }
 

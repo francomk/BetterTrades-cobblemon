@@ -42,7 +42,7 @@
   "chat.staff.escrow_unreadable": "&c{0} item in custodia di {1} non sono piu' rileggibili e sono stati chiusi come UNREADABLE. Non sono recuperabili in automatico.",
   "chat.staff.escrow_stuck": "&4Scambio {0}: {1} righe di custodia non si sono chiuse, quindi non e' stato consegnato niente. Restano HELD e tornano al proprietario al suo prossimo accesso.",
   "chat.staff.item_lost": "&4Scambio {0}: {1} si e' scollegato mentre la custodia falliva. {2} x{3} NON e' recuperabile in automatico: va restituito a mano.",
-  "chat.staff.refund_failed": "&4Scambio {0}: lo storno di {1} a {2} e' FALLITO. Ha pagato e non ha ricevuto niente: va rimborsato a mano.",
+  "chat.staff.refund_failed": "&4Scambio {0}: lo storno di {1} a {2} non e' andato a buon fine. Il denaro e' trattenuto e viene ritentato al prossimo riavvio: controlla se continua a fallire.",
   "chat.staff.refund_unknown": "&4Scambio {0}: lo storno di {1} a {2} non ha risposto in tempo e puo' ancora andare a buon fine. Controllare il saldo PRIMA di rimborsare a mano.",
   "chat.staff.commit_stuck": "&4Scambio {0} ({1} / {2}) si e' bloccato durante il pagamento ed e' stato chiuso d'ufficio. Lo stato del pagamento e' ignoto: va controllato a mano.",
   "gui.plaque": "BetterTrades",
@@ -71,7 +71,7 @@
   "gui.warn.title": "&6ATTENZIONE",
   "gui.warn.you": "&fIL TUO\n&fINVENTARIO\n&cE' PIENO.\n\n&fFAI SPAZIO\n&fPER FINIRE.",
   "gui.warn.other": "&fIL SUO\n&fINVENTARIO\n&cE' PIENO.\n\n&fIN ATTESA.",
-  "gui.picker.title": "Scegli un Pokemon",
+  "gui.picker.plaque": "Scegli un Pokemon",
   "gui.picker.party_empty": "&8Squadra: posto vuoto",
   "gui.picker.empty": "&8Vuoto",
   "gui.picker.previous": "&eBox precedente",
@@ -150,5 +150,9 @@
   "chat.error.pokemon_on_offer": "&cQuel Pokemon e' in offerta in uno scambio: toglilo prima dall'offerta.",
   "chat.error.item_too_nested": "contenitori annidati troppo in profondita' per essere controllati",
   "chat.staff.escrow_close_stuck": "&4Scambio {0} ({1} / {2}) si e' bloccato durante la chiusura dell'escrow ed e' stato chiuso d'ufficio. Non e' stato pagato niente; gli item tornano ai proprietari.",
-  "command.blacklist.species_unknown": "&cNessuna specie e' registrata come &f{0}&c."
+  "command.blacklist.species_unknown": "&cNessuna specie e' registrata come &f{0}&c.",
+  "chat.error.too_fast": "&cRallenta: troppi item spostati nell'ultimo secondo.",
+  "chat.error.pokemon_pastured": "&cQuel Pokemon sta pascolando: riportalo prima nel PC.",
+  "chat.staff.payout_failed": "&4Scambio {0}: il pagamento di {1} a {2} non e' stato consegnato. Il denaro e' trattenuto e viene ritentato al prossimo riavvio: controlla se continua a fallire.",
+  "gui.picker.lore.pastured": "&cAl pascolo"
 }

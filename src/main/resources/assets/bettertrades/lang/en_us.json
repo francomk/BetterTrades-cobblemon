@@ -42,7 +42,7 @@
   "chat.staff.escrow_unreadable": "&c{0} escrowed item(s) belonging to {1} could not be read back and were closed as UNREADABLE. They are not recoverable automatically.",
   "chat.staff.escrow_stuck": "&4Trade {0}: {1} escrowed row(s) could not be closed, so nothing was handed over. They stay HELD and go back to their owner on their next login.",
   "chat.staff.item_lost": "&4Trade {0}: {1} disconnected while the escrow write was failing. {2} x{3} is NOT recoverable automatically - give it back by hand.",
-  "chat.staff.refund_failed": "&4Trade {0}: the {1} refund to {2} FAILED. They paid and received nothing - refund them by hand.",
+  "chat.staff.refund_failed": "&4Trade {0}: the {1} refund to {2} did not go through. The money is held and retried at the next restart - check it if it keeps failing.",
   "chat.staff.refund_unknown": "&4Trade {0}: the {1} refund to {2} did not answer in time and may still go through. Check their balance BEFORE refunding by hand.",
   "chat.staff.commit_stuck": "&4Trade {0} ({1} / {2}) hung while paying and was force-closed. The payment state is unknown - check it by hand.",
   "gui.plaque": "BetterTrades",
@@ -71,7 +71,7 @@
   "gui.warn.title": "&6WARNING",
   "gui.warn.you": "&fYOUR\n&fINVENTORY\n&cIS FULL.\n\n&fFREE SPACE\n&fTO CONFIRM.",
   "gui.warn.other": "&fTHEIR\n&fINVENTORY\n&cIS FULL.\n\n&fWAITING FOR\n&fTHEM.",
-  "gui.picker.title": "Choose a Pokemon",
+  "gui.picker.plaque": "Choose a Pokemon",
   "gui.picker.party_empty": "&8Party: empty slot",
   "gui.picker.empty": "&8Empty",
   "gui.picker.previous": "&ePrevious box",
@@ -150,5 +150,9 @@
   "chat.error.pokemon_on_offer": "&cThat Pokemon is on offer in a trade: take it out of the offer first.",
   "chat.error.item_too_nested": "containers nested too deeply to be checked",
   "chat.staff.escrow_close_stuck": "&4Trade {0} ({1} / {2}) hung while closing escrow and was force-closed. Nothing was paid; the items go back to their owners.",
-  "command.blacklist.species_unknown": "&cNo species is registered as &f{0}&c."
+  "command.blacklist.species_unknown": "&cNo species is registered as &f{0}&c.",
+  "chat.error.too_fast": "&cSlow down: too many items moved in the last second.",
+  "chat.error.pokemon_pastured": "&cThat Pokemon is grazing in a pasture: take it back to the PC first.",
+  "chat.staff.payout_failed": "&4Trade {0}: the {1} payment to {2} could not be delivered. The money is held and retried at the next restart - check it if it keeps failing.",
+  "gui.picker.lore.pastured": "&cIn a pasture"
 }

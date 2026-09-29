@@ -48,10 +48,19 @@
     {
       "type": "bitmap",
       "file": "bettertrades:gui/money_input.png",
-      "height": 80,
-      "ascent": 16,
+      "height": 174,
+      "ascent": 21,
       "chars": [
         ""
+      ]
+    },
+    {
+      "type": "bitmap",
+      "file": "bettertrades:gui/picker_background.png",
+      "height": 234,
+      "ascent": 25,
+      "chars": [
+        ""
       ]
     },
     {

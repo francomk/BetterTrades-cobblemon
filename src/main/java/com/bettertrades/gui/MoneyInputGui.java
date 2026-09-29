@@ -9,7 +9,6 @@ import eu.pb4.sgui.api.ClickType;
 import eu.pb4.sgui.api.elements.GuiElementBuilder;
 import eu.pb4.sgui.api.elements.GuiElementInterface;
 import eu.pb4.sgui.api.gui.AnvilInputGui;
-import net.minecraft.item.Items;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -24,16 +23,17 @@ import java.util.UUID;
  * The amount is typed into an anvil: a slot screen has no text fields, and a chat command will not
  * do because opening the chat closes the window and would cancel the trade.
  *
- * The panel is artwork in the title, like the trade screen's (see {@link GuiTextures}): its blue
- * box lies under the anvil's own text field, so the typed amount shows up on the display, and
- * the back and confirm buttons are items on the anvil's second input slot and its output slot.
+ * The whole screen is artwork in the title, like the trade screen's (see {@link GuiTextures}): its
+ * blue box lies under the anvil's own text field, so the typed amount shows up on the display,
+ * the coin frame surrounds the first input slot, and the back and confirm buttons are items on
+ * the anvil's second input slot and its output slot.
  */
 public final class MoneyInputGui extends AnvilInputGui implements SessionScreen {
 
     private static final int BACK_SLOT = 1;
     private static final int CONFIRM_SLOT = 2;
-    /** Where the panel starts on the anvil texture: the buttons then fall on slots 1 and 2. */
-    private static final int PANEL_X = 40;
+    /** The artwork covers the whole anvil texture, so it starts at the texture's left edge. */
+    private static final int PANEL_X = 0;
 
     private final TradeScreens screens;
     private final TradeSession session;
@@ -60,7 +60,8 @@ public final class MoneyInputGui extends AnvilInputGui implements SessionScreen 
         setTitle(GuiTextures.anvilComposer().moneyInput(PANEL_X).build());
         // The anvil's text field starts with the name of the item in slot 0: an empty name leaves
         // the field empty, ready for the amount, instead of a hint the player has to delete first.
-        setSlot(0, new GuiElementBuilder(Items.PAPER)
+        // The item itself draws nothing, so the coin frame in the background shows through.
+        setSlot(0, GuiElementBuilder.from(Icons.blank())
                 .setName(Text.empty())
                 .setLore(Lang.lines("gui.money.input.lore"))
                 .build());

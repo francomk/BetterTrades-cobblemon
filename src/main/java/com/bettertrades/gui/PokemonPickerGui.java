@@ -19,7 +19,14 @@ import net.minecraft.text.Text;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Party on the first row, PC boxes below, one box per page. */
+/**
+ * Party on the first row, PC boxes below, one box per page.
+ *
+ * Like the trade screen, the panel is artwork in the title (see {@link GuiTextures}) and the
+ * buttons on the last row are items with a model of their own, so they click and show a tooltip.
+ * The frame in the middle of that row is part of the background; the Poke Ball drawn in it
+ * carries the box counter.
+ */
 public final class PokemonPickerGui extends SimpleGuiBase {
 
     private static final int PARTY_SIZE = 6;
@@ -40,7 +47,9 @@ public final class PokemonPickerGui extends SimpleGuiBase {
         this.screens = screens;
         this.session = screens.session();
         this.parent = parent;
-        setTitle(Lang.text("gui.picker.title"));
+        // Drawn once: nothing on the panel changes while the picker is open. The words on the
+        // plaque sit above the title line, so gen_gui_assets.py paints them into the texture.
+        setTitle(GuiTextures.composer().pickerBackground().build());
     }
 
     public static void open(ServerPlayerEntity player, TradeScreens screens, TradeGui parent) {
@@ -76,11 +85,11 @@ public final class PokemonPickerGui extends SimpleGuiBase {
             }
         }
 
-        setStack(PREVIOUS_BOX, Icons.arrow(), Lang.name("gui.picker.previous"), List.of());
-        setStack(NEXT_BOX, Icons.arrow(), Lang.name("gui.picker.next"), List.of());
-        setStack(BOX_LABEL, Icons.divider(),
+        setStack(PREVIOUS_BOX, Icons.boxPrevious(), Lang.name("gui.picker.previous"), List.of());
+        setStack(NEXT_BOX, Icons.boxNext(), Lang.name("gui.picker.next"), List.of());
+        setStack(BOX_LABEL, Icons.pokeBall(),
                 Lang.name("gui.picker.box", boxIndex + 1, boxCount()), List.of());
-        setStack(BACK, Icons.withdraw(), Lang.name("gui.picker.back"), List.of());
+        setStack(BACK, Icons.pickerBack(), Lang.name("gui.picker.back"), List.of());
     }
 
     private Text name(Pokemon pokemon) {
@@ -95,6 +104,7 @@ public final class PokemonPickerGui extends SimpleGuiBase {
         lore.add(Lang.name("gui.picker.lore.where", where));
         if (pokemon.getShiny()) lore.add(Lang.name("gui.picker.lore.shiny"));
         if (!pokemon.getTradeable()) lore.add(Lang.name("gui.picker.lore.untradeable"));
+        if (pokemon.getTetheringId() != null) lore.add(Lang.name("gui.picker.lore.pastured"));
         return lore;
     }
 

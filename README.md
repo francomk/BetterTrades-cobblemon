@@ -61,8 +61,8 @@ separately. Cobblemon does not: it is already on your server.
 
 ### The resource pack
 
-The trade screen is drawn with models and fonts that live in Polymer's resource pack, so players
-have to receive it. Polymer can host it for you, but its auto-host is **off by default** on a
+The trade screen, the money input and the Pokémon picker are drawn with models and fonts that live in Polymer's
+resource pack, so players have to receive it. Polymer can host it for you, but its auto-host is **off by default** on a
 production server. Turn it on in `config/polymer/auto-host.json`:
 
 ```jsonc

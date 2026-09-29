@@ -14,6 +14,7 @@ import com.bettertrades.db.Database;
 import com.bettertrades.db.Ulid;
 import com.bettertrades.economy.MoneyService;
 import com.bettertrades.escrow.EscrowService;
+import com.bettertrades.escrow.TradeJournal;
 import com.bettertrades.history.TradeHistory;
 import com.bettertrades.lang.Lang;
 import com.bettertrades.util.PlayerSaves;
@@ -67,6 +68,17 @@ public final class TradeSession {
     /** Ticks during which a button that has just become "cancel" ignores clicks: a quarter of a second. */
     private static final int CONFIRM_GRACE_TICKS = 5;
 
+    /**
+     * Item moves into or out of the offer allowed per side in {@link #OPS_WINDOW_TICKS}.
+     *
+     * Every one of them writes the whole player file on the server thread and an escrow row: an
+     * unthrottled client alternating offer and removal turned that into disk I/O inside every tick
+     * and a table growing without end. Two full grids a second is more than any hand can click, and
+     * a drag across the inventory still fits.
+     */
+    private static final int OPS_PER_WINDOW = 16;
+    private static final int OPS_WINDOW_TICKS = 20;
+
     public enum Stage { OFFERING, LOCKED, COMMITTING, CLOSED }
 
     public static final class Side {
@@ -83,6 +95,9 @@ public final class TradeSession {
          * removed.
          */
         private int pending;
+        /** Start tick of the current rate window, and the item moves counted inside it. */
+        private int opsWindowStart;
+        private int ops;
         private boolean ready;
         private long money;
 
@@ -123,6 +138,11 @@ public final class TradeSession {
      * trade completes they belong to nobody: every way out of COMMITTING has to give them back.
      */
     private List<Transfer> claimed;
+    /**
+     * The money withdrawn from the payer and held for this trade, null when there is none. Until the
+     * trade completes it belongs to nobody: every way out of COMMITTING has to give it back.
+     */
+    private Held held;
     private CancelReason pendingCancel;
     private String pendingCancelName;
     private Runnable onChanged = () -> {};
@@ -195,6 +215,11 @@ public final class TradeSession {
             return;
         }
         if (stack.isEmpty()) return;
+        if (throttled(side)) {
+            EscrowService.give(player, stack);
+            Texts.denied(player, "chat.error.too_fast");
+            return;
+        }
 
         Optional<String> blocked = Blacklist.check(stack);
         if (blocked.isPresent()) {
@@ -248,10 +273,18 @@ public final class TradeSession {
             // disconnected in between. Delivering to an already removed entity writes into an
             // inventory that will never be saved - PlayerManager.remove saves the file BEFORE
             // removing the player - and the item vanishes.
-            ServerPlayerEntity owner = playerOf(side);
-            boolean online = owner != null && !owner.isRemoved();
+            ServerPlayerEntity owner = EscrowService.online(server, side.playerId);
+            boolean online = owner != null;
             if (error != null) {
                 BetterTrades.LOGGER.error("Escrow failed for {}", side.playerName, error);
+                ServerPlayerEntity dying = playerOf(side);
+                if (!online && dying != null && !dying.isRemoved()) {
+                    // Connected but dead: the inventory is the corpse's and the respawn will not copy
+                    // it. With no escrow row to bring it back, the item goes where the rest of their
+                    // inventory went - on the ground where they died.
+                    dying.dropItem(held, true, false);
+                    return;
+                }
                 if (!online) {
                     // Here the escrow row was never written: at the next login there is nothing to
                     // give back. It is the one point where the item is not automatically
@@ -285,6 +318,12 @@ public final class TradeSession {
         if (frozen() || side.full()) return;
         if (BetterTradesConfig.get().trade.respectTradeableFlag && !pokemon.getTradeable()) {
             Texts.denied(player, "chat.error.pokemon_untradeable");
+            return;
+        }
+        if (pokemon.getTetheringId() != null) {
+            // Grazing in a pasture: the pasture block finds it again through the PC of the owner it
+            // was tethered by, and after a trade it would be looking in the wrong one.
+            Texts.denied(player, "chat.error.pokemon_pastured");
             return;
         }
         Optional<String> blocked = Blacklist.check(pokemon);
@@ -332,6 +371,10 @@ public final class TradeSession {
     public void removeEntry(ServerPlayerEntity player, int index) {
         Side side = sideOf(player.getUuid());
         if (frozen() || index < 0 || index >= side.entries.size()) return;
+        if (side.entries.get(index) instanceof OfferEntry.Item && throttled(side)) {
+            Texts.denied(player, "chat.error.too_fast");
+            return;
+        }
         OfferEntry entry = side.entries.remove(index);
         if (entry instanceof OfferEntry.Item item) {
             giveBack(item, side);
@@ -591,6 +634,26 @@ public final class TradeSession {
         onChanged.run();
     }
 
+    /** Counts one item move for this side: true when the side is over its rate. */
+    private boolean throttled(Side side) {
+        int now = server.getTicks();
+        if (now - side.opsWindowStart >= OPS_WINDOW_TICKS || now < side.opsWindowStart) {
+            side.opsWindowStart = now;
+            side.ops = 0;
+        }
+        return ++side.ops > OPS_PER_WINDOW;
+    }
+
+    /**
+     * Server stop while this session is committing: it is told to stop at the next check, so that
+     * the escrow and the money go back while the two players are still connected.
+     */
+    void stopRequested() {
+        if (stage != Stage.COMMITTING || pendingCancel != null) return;
+        pendingCancel = CancelReason.ADMIN;
+        pendingCancelName = left.playerName;
+    }
+
     // ------------------------------------------------------------------ closing
 
     /**
@@ -727,15 +790,15 @@ public final class TradeSession {
         stage = Stage.COMMITTING;
         commitTicks = 0;
         claimed = null;
+        held = null;
         List<Transfer> transfers = transfers();
-        if (transfers.isEmpty()) {
-            afterClaim(transfers, List.of(), null, net);
-            return;
-        }
         List<String> ids = new ArrayList<>(transfers.size());
         for (Transfer transfer : transfers) ids.add(transfer.item().escrowId());
-        EscrowService.consume(ids).whenComplete((done, error) -> server.execute(() ->
-                afterClaim(transfers, done, error, net)));
+        // Even with no items: the journal row opened here is what the money is recorded against.
+        EscrowService.consume(tradeId, ids).whenComplete((done, error) -> server.execute(() -> {
+            if (TradeSessions.stopped()) return;
+            afterClaim(transfers, done, error, net);
+        }));
     }
 
     /**
@@ -754,10 +817,13 @@ public final class TradeSession {
         }
         if (stage != Stage.COMMITTING) {
             // The watchdog closed the session while the close was in flight. Its cancel found the
-            // rows no longer HELD, or will find them so: whatever this close claimed goes back here.
-            if (!got.isEmpty()) {
-                BetterTrades.LOGGER.warn("Trade {}: escrow closed after the session had been closed,"
-                        + " {} items given back to their owners", tradeId, got.size());
+            // rows no longer HELD, or will find them so: whatever this close claimed goes back here,
+            // and the journal row the close opened is marked ABORTED even when it claimed nothing.
+            if (error == null) {
+                if (!got.isEmpty()) {
+                    BetterTrades.LOGGER.warn("Trade {}: escrow closed after the session had been closed,"
+                            + " {} items given back to their owners", tradeId, got.size());
+                }
                 EscrowService.restore(server, tradeId, owners(got));
             }
             return;
@@ -789,66 +855,99 @@ public final class TradeSession {
             return;
         }
         if (net == 0) {
-            finishTransfer(nowLeft, nowRight, 0);
+            commitAndFinish(0);
             return;
         }
         if (!MoneyService.available()) {
             abort(CancelReason.MONEY, Lang.raw("chat.cancel.money.no_economy"));
             return;
         }
-        pay(net);
+        holdMoney(net);
     }
 
-    /** Only the difference moves: a single transaction, so one payment cannot land without the other. */
-    private void pay(long net) {
+    /** The money withdrawn from the payer, waiting for the trade to decide who receives it. */
+    private record Held(UUID payer, UUID payee, long amount, String payerName) {}
+
+    /**
+     * Only the difference moves, and it is first taken from the payer and held: see
+     * {@link MoneyService#take}. Nobody can spend it while the last checks run, so stopping the
+     * trade after this point gives it back with a deposit that cannot be refused for lack of funds.
+     */
+    private void holdMoney(long net) {
         // The watchdog measures the payment alone: the escrow close does not eat into its time.
         commitTicks = 0;
-        UUID payer = net > 0 ? left.playerId : right.playerId;
-        UUID payee = net > 0 ? right.playerId : left.playerId;
-        String payerName = net > 0 ? left.playerName : right.playerName;
-        long amount = Math.abs(net);
-        committingPayerName = payerName;
+        Held wanted = new Held(net > 0 ? left.playerId : right.playerId,
+                net > 0 ? right.playerId : left.playerId, Math.abs(net),
+                net > 0 ? left.playerName : right.playerName);
+        committingPayerName = wanted.payerName();
 
-        MoneyService.Operation<Boolean> payment = MoneyService.pay(payer, payee, amount);
-        payment.awaited().whenComplete((paid, error) -> server.execute(() -> {
-            // The watchdog may already have closed this session while the payment was in flight.
-            // It gave the items back; what is left here is the money.
+        MoneyService.Operation<Boolean> hold = MoneyService.take(tradeId, wanted.payer(), wanted.payee(),
+                wanted.amount());
+        hold.awaited().whenComplete((taken, error) -> server.execute(() -> {
+            if (TradeSessions.stopped()) return;
+            // The watchdog may already have closed this session while the hold was in flight. It gave
+            // the items back; what is left here is the money.
             if (stage != Stage.COMMITTING) {
-                BetterTrades.LOGGER.error("Trade {}: the payment came back to an already closed"
-                        + " session (stage {}). Payment outcome: {}", tradeId, stage,
-                        error != null ? "error" : String.valueOf(paid));
+                BetterTrades.LOGGER.error("Trade {}: the hold came back to an already closed session"
+                        + " (stage {}). Outcome: {}", tradeId, stage,
+                        error != null ? "error" : String.valueOf(taken));
                 if (error != null) {
-                    refundIfItLandsLate(payment, payee, payer, amount, payerName);
-                } else if (Boolean.TRUE.equals(paid)) {
-                    refund(payee, payer, amount, payerName);
+                    refundIfHeldLate(hold, wanted);
+                } else if (Boolean.TRUE.equals(taken)) {
+                    refund(wanted);
                 }
                 return;
             }
             if (error != null) {
-                // A timeout, not a refusal: the transfer is still on the economy worker and may
-                // succeed a minute from now. Cancelling here and nothing else would leave the payer
-                // without money and without items, so the trade closes and the refund hooks onto the
-                // real outcome instead of the one we stopped waiting for.
-                refundIfItLandsLate(payment, payee, payer, amount, payerName);
-                abort(CancelReason.MONEY, payerName);
+                // A timeout, not a refusal: the withdraw is still on the economy worker and may
+                // succeed a minute from now. The refund hooks onto its real outcome.
+                refundIfHeldLate(hold, wanted);
+                abort(CancelReason.MONEY, wanted.payerName());
                 return;
             }
-            if (!Boolean.TRUE.equals(paid)) {
-                abort(CancelReason.MONEY, payerName);
+            if (!Boolean.TRUE.equals(taken)) {
+                abort(CancelReason.MONEY, wanted.payerName());
                 return;
             }
-            // The payment can take seconds, and the Pokemon were last looked at before it started.
+            held = wanted;
+            // The hold can take seconds, and the Pokemon were last looked at before it started.
             // A release sent from a modified client, a held item taken off, a battle started: any
-            // of them here means the buyer paid for something that is no longer there.
+            // of them here means the buyer would pay for something that is no longer there. The
+            // money is held, so stopping costs nobody anything.
+            Stop stop = lastChecks(playerOf(left), playerOf(right));
+            if (stop != null) {
+                abort(stop.reason(), stop.name());
+                return;
+            }
+            commitAndFinish(net > 0 ? wanted.amount() : -wanted.amount());
+        }));
+    }
+
+    /**
+     * Writes the point of no return, then moves everything.
+     *
+     * The journal says COMMITTED before the first item or Pokemon moves: a restart that finds it
+     * pays the payee, one that finds OPEN gives everything back. The checks run once more when the
+     * write comes back, because it too leaves the server thread.
+     */
+    private void commitAndFinish(long netFromLeft) {
+        TradeJournal.committed(tradeId).whenComplete((ignored, error) -> server.execute(() -> {
+            if (TradeSessions.stopped()) return;
+            if (stage != Stage.COMMITTING) return;
+            if (error != null) {
+                BetterTrades.LOGGER.error("Trade {}: the commit could not be recorded, trade cancelled"
+                        + " before anything moved", tradeId, error);
+                abort(CancelReason.DATABASE_DOWN, left.playerName);
+                return;
+            }
             ServerPlayerEntity nowLeft = playerOf(left);
             ServerPlayerEntity nowRight = playerOf(right);
             Stop stop = lastChecks(nowLeft, nowRight);
             if (stop != null) {
-                refund(payee, payer, amount, payerName);
                 abort(stop.reason(), stop.name());
                 return;
             }
-            finishTransfer(nowLeft, nowRight, net > 0 ? amount : -amount);
+            finishTransfer(nowLeft, nowRight, netFromLeft);
         }));
     }
 
@@ -871,6 +970,11 @@ public final class TradeSession {
         }
         String battling = inBattle(nowLeft, nowRight);
         if (battling != null) return new Stop(CancelReason.BATTLE, battling);
+        // commit() looked at the space before the asynchronous steps, and in COMMITTING the window
+        // can be closed: whoever receives can fill party, PC or inventory in the meantime. Without
+        // this the Pokemon went back to the sender with the money paid, and the items on the floor.
+        if (inventoryBlocked(left)) return new Stop(CancelReason.INVENTORY_FULL, left.playerName);
+        if (inventoryBlocked(right)) return new Stop(CancelReason.INVENTORY_FULL, right.playerName);
         return null;
     }
 
@@ -885,6 +989,10 @@ public final class TradeSession {
     /** Cancels from inside COMMITTING, after the escrow close: the claimed items go back first. */
     private void abort(CancelReason reason, String culpritName) {
         releaseClaimed();
+        if (held != null) {
+            refund(held);
+            held = null;
+        }
         stage = Stage.OFFERING;
         pendingCancel = null;
         cancel(reason, culpritName);
@@ -898,6 +1006,8 @@ public final class TradeSession {
         if (claimed == null) return;
         List<Transfer> back = claimed;
         claimed = null;
+        // Also with no items: the transaction marks the journal ABORTED, so the held money is not
+        // paid to the payee by a restart.
         EscrowService.restore(server, tradeId, owners(back));
         left.entries.removeIf(entry -> entry instanceof OfferEntry.Item);
         right.entries.removeIf(entry -> entry instanceof OfferEntry.Item);
@@ -931,71 +1041,46 @@ public final class TradeSession {
                 transfer.to().playerId, transfer.to().playerName);
     }
 
-    /**
-     * Puts the money back where it was after a cancel that arrived once the payment had started.
-     *
-     * transfer() returns false without throwing when the account cannot be resolved, when the
-     * balance is no longer enough because the payee has already spent it, and when there is no
-     * economy. Discarding that value and logging "refunded" leaves the payer without money and with
-     * nothing in hand, and the staff investigating reads a line saying the opposite. A second
-     * attempt covers an Impactor timeout; beyond that a human hand is needed, and it has to be said.
-     */
-    private void refund(UUID payee, UUID payer, long amount, String payerName) {
-        attemptRefund(payee, payer, amount, payerName, true);
+    /** Gives held money back to the payer: a deposit, which no balance can refuse. */
+    private void refund(Held money) {
+        MoneyService.release(tradeId, money.payer(), money.amount(), false, () -> {
+            BetterTrades.LOGGER.error("REFUND NOT DONE trade={} amount={} to={} ({}): the money is held"
+                            + " in the trade journal and is retried at the next start",
+                    tradeId, money.amount(), money.payer(), money.payerName());
+            server.execute(() -> Texts.staff(server, "chat.staff.refund_failed",
+                    tradeId, money.amount(), money.payerName()));
+        }).settled().whenComplete((done, error) -> {
+            if (Boolean.TRUE.equals(done)) {
+                BetterTrades.LOGGER.warn("Trade {} cancelled after the hold: {} returned to {}",
+                        tradeId, money.amount(), money.payerName());
+            }
+        });
     }
 
-    /**
-     * One refund attempt, and the second only once the first has really finished.
-     *
-     * The difference between "the provider said no" and "it did not answer in time" is worth double
-     * the money here: a transfer() that expires is still running on the economy worker, so retrying
-     * would give the amount back twice. It is retried only on a real false, which is a finished
-     * operation that moved nothing.
-     */
-    private void attemptRefund(UUID payee, UUID payer, long amount, String payerName, boolean first) {
-        MoneyService.pay(payee, payer, amount).awaited().whenComplete((paid, error) -> {
-            if (error == null && Boolean.TRUE.equals(paid)) {
-                BetterTrades.LOGGER.warn("Trade {} cancelled after the payment: {} returned to {}{}",
-                        tradeId, amount, payerName, first ? "" : " on the second attempt");
-                return;
-            }
-            if (error != null) {
-                BetterTrades.LOGGER.error("REFUND OF UNKNOWN OUTCOME trade={} amount={} from={} to={} ({}):"
-                                + " it did not answer in time and may still succeed on its own."
-                                + " Check the balance BEFORE refunding by hand; the real outcome"
-                                + " ends up in the economy log",
-                        tradeId, amount, payee, payer, payerName, error);
-                server.execute(() -> Texts.staff(server, "chat.staff.refund_unknown",
-                        tradeId, amount, payerName));
-                return;
-            }
-            if (first) {
-                attemptRefund(payee, payer, amount, payerName, false);
-                return;
-            }
-            BetterTrades.LOGGER.error("REFUND FAILED trade={} amount={} from={} to={} ({}):"
-                            + " {} paid and received nothing, they must be refunded by hand",
-                    tradeId, amount, payee, payer, payerName, payerName);
-            server.execute(() -> Texts.staff(server, "chat.staff.refund_failed",
-                    tradeId, amount, payerName));
+    /** Hands held money to the payee of a trade that went through. */
+    private void payOut(Held money, String payeeName) {
+        MoneyService.release(tradeId, money.payee(), money.amount(), true, () -> {
+            BetterTrades.LOGGER.error("PAYMENT NOT DELIVERED trade={} amount={} to={} ({}): the money is"
+                            + " held in the trade journal and is retried at the next start",
+                    tradeId, money.amount(), money.payee(), payeeName);
+            server.execute(() -> Texts.staff(server, "chat.staff.payout_failed",
+                    tradeId, money.amount(), payeeName));
         });
     }
 
     /**
-     * Hooks the refund onto the REAL outcome of a payment given up for lost.
+     * Hooks the refund onto the REAL outcome of a hold given up for lost.
      *
-     * {@code awaited} has expired and the trade has already been cancelled, but the transfer was
-     * never switched off: if it lands, the money has moved for a trade that no longer exists.
-     * {@code settled} is the only place where that outcome shows up.
+     * {@code awaited} has expired and the trade has already been cancelled, but the withdraw was
+     * never switched off: if it lands, the money is held for a trade that no longer exists.
      */
-    private void refundIfItLandsLate(MoneyService.Operation<Boolean> payment, UUID payee, UUID payer,
-                                     long amount, String payerName) {
-        payment.settled().whenComplete((paid, error) -> {
-            if (error != null || !Boolean.TRUE.equals(paid)) return;
-            BetterTrades.LOGGER.error("Trade {}: the payment of {} by {} succeeded AFTER the trade"
-                            + " had been cancelled on timeout. Refund in progress.",
-                    tradeId, amount, payerName);
-            refund(payee, payer, amount, payerName);
+    private void refundIfHeldLate(MoneyService.Operation<Boolean> hold, Held money) {
+        hold.settled().whenComplete((taken, error) -> {
+            if (error != null || !Boolean.TRUE.equals(taken)) return;
+            BetterTrades.LOGGER.error("Trade {}: the hold of {} from {} succeeded AFTER the trade had"
+                    + " been cancelled on timeout. Refund in progress.", tradeId, money.amount(),
+                    money.payerName());
+            refund(money);
         });
     }
 
@@ -1008,6 +1093,16 @@ public final class TradeSession {
         stage = Stage.CLOSED;
         List<Transfer> items = claimed == null ? List.of() : claimed;
         claimed = null;
+        Held money = held;
+        held = null;
+        // Described BEFORE delivery: insertStack empties the very stack it is handed, and read
+        // afterwards every item came out as minecraft:air x0 in the post-trade event.
+        java.util.Map<Transfer, TradeView.ItemView> itemViews = new java.util.IdentityHashMap<>();
+        for (Transfer transfer : items) {
+            ItemStack stack = transfer.item().stack();
+            itemViews.put(transfer, new TradeView.ItemView(transfer.from().playerId,
+                    Registries.ITEM.getId(stack.getItem()).toString(), stack.getCount()));
+        }
         List<Transfer> handed = new ArrayList<>();
         List<InFlight> delivered = new ArrayList<>();
         // The try opens HERE, not after the preparation.
@@ -1069,6 +1164,12 @@ public final class TradeSession {
             // leaving the other where it is.
             PlayerSaves.everything(playerOf(left));
             PlayerSaves.everything(playerOf(right));
+            // The money goes out only now, with everything else already on its way to disk: a
+            // restart before this line finds the journal COMMITTED and pays the payee from there.
+            if (money != null) {
+                payOut(money, money.payee().equals(left.playerId) ? left.playerName : right.playerName);
+            }
+            TradeJournal.done(tradeId);
             // Whatever throws above - Cobblemon on a Pokemon that will not serialise, a species
             // removed by a datapack, a third-party observer - the session MUST leave BY_PLAYER.
             // Otherwise it stays there with stage CLOSED and the two players are stuck forever:
@@ -1080,7 +1181,7 @@ public final class TradeSession {
         // session is no longer in BY_PLAYER. With a try of its own, though: the code running here
         // is not ours and must not be able to travel back up into the economy callback.
         try {
-            TradeEvents.firePost(outcomeView(handed, delivered, netFromLeft));
+            TradeEvents.firePost(outcomeView(handed, itemViews, delivered, netFromLeft));
         } catch (RuntimeException e) {
             BetterTrades.LOGGER.error("Trade {}: an API observer threw on firePost."
                     + " The trade was already complete", tradeId, e);
@@ -1093,13 +1194,10 @@ public final class TradeSession {
      * Not the pre-commit view: a Pokemon sent back to its owner because the other store was full
      * was not traded, and one that evolved on arrival is no longer the species it was offered as.
      */
-    private TradeView.Pending outcomeView(List<Transfer> items, List<InFlight> pokemon, long netFromLeft) {
+    private TradeView.Pending outcomeView(List<Transfer> items, java.util.Map<Transfer, TradeView.ItemView> views,
+                                          List<InFlight> pokemon, long netFromLeft) {
         List<TradeView.ItemView> itemViews = new ArrayList<>(items.size());
-        for (Transfer transfer : items) {
-            ItemStack stack = transfer.item().stack();
-            itemViews.add(new TradeView.ItemView(transfer.from().playerId,
-                    Registries.ITEM.getId(stack.getItem()).toString(), stack.getCount()));
-        }
+        for (Transfer transfer : items) itemViews.add(views.get(transfer));
         List<TradeView.MonView> monViews = new ArrayList<>(pokemon.size());
         for (InFlight held : pokemon) monViews.add(monView(held.fromId(), held.pokemon()));
         return new TradeView.Pending(tradeId, left.playerId, right.playerId, List.copyOf(itemViews),
@@ -1264,6 +1362,14 @@ public final class TradeSession {
             takePokemon(left, leftPlayer, rightPlayer, inFlight);
             takePokemon(right, rightPlayer, leftPlayer, inFlight);
         } finally {
+            // The stores are written once with the Pokemon taken out and once more after delivery.
+            // Cobblemon serialises on this thread and writes the files one by one on a single
+            // thread of its own, in order: a crash between two of those writes can then only lose a
+            // Pokemon, never leave it both in the new owner's file and in the old owner's.
+            if (!inFlight.isEmpty()) {
+                PlayerSaves.pokemon(leftPlayer);
+                PlayerSaves.pokemon(rightPlayer);
+            }
             // Whatever already left a store has to be delivered or put back, even if takePokemon
             // threw halfway: otherwise it stays outside every store.
             deliverPokemon(inFlight, rows, delivered);

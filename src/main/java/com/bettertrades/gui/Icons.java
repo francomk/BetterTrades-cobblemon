@@ -27,8 +27,8 @@ import java.nio.file.Path;
  * The models scale themselves up so one texture pixel covers one screen pixel, which is how
  * they land exactly where the mockup drew them - see tools/gen_gui_assets.py.
  *
- * The money anvil's two buttons work the same way. The other screens still use vanilla items:
- * they get their own artwork when their mockups do.
+ * The money anvil's two buttons and the Pokemon picker's arrows work the same way. The picker's
+ * empty slots and dividers are still vanilla items.
  */
 public final class Icons {
 
@@ -41,6 +41,10 @@ public final class Icons {
     private static PolymerModelData confirmDone;
     private static PolymerModelData moneyBack;
     private static PolymerModelData moneyConfirm;
+    private static PolymerModelData blank;
+    private static PolymerModelData boxPrevious;
+    private static PolymerModelData boxNext;
+    private static PolymerModelData pickerBack;
     private static final PolymerModelData[] cancel = new PolymerModelData[CANCEL_FRAMES];
 
     private Icons() {}
@@ -57,6 +61,10 @@ public final class Icons {
         confirmDone = model("btn_confirm_done");
         moneyBack = model("btn_money_back");
         moneyConfirm = model("btn_money_confirm");
+        blank = model("btn_blank");
+        boxPrevious = model("btn_box_previous");
+        boxNext = model("btn_box_next");
+        pickerBack = model("btn_picker_back");
         for (int frame = 0; frame < CANCEL_FRAMES; frame++) {
             cancel[frame] = model("btn_cancel_" + (frame + 1));
         }
@@ -120,8 +128,11 @@ public final class Icons {
         return trash.asStack();
     }
 
-    /** The real Cobblemon Poke Ball: it sits inside the frame the background already draws. */
-    public static ItemStack addPokemon() {
+    /**
+     * The real Cobblemon Poke Ball: it sits inside the frame the background already draws, on the
+     * trade screen's Pokemon button and on the picker's box counter.
+     */
+    public static ItemStack pokeBall() {
         return new ItemStack(CobblemonItems.POKE_BALL);
     }
 
@@ -146,15 +157,32 @@ public final class Icons {
         return moneyConfirm.asStack();
     }
 
+    /**
+     * An item that draws nothing. The anvil's first slot needs one, since its name seeds the
+     * text field, but the coin frame around that slot is already part of the background.
+     */
+    public static ItemStack blank() {
+        return blank.asStack();
+    }
+
+    public static ItemStack boxPrevious() {
+        return boxPrevious.asStack();
+    }
+
+    public static ItemStack boxNext() {
+        return boxNext.asStack();
+    }
+
+    /** The picker's red arrow, back to the trade. */
+    public static ItemStack pickerBack() {
+        return pickerBack.asStack();
+    }
+
     public static int cancelFrames() {
         return CANCEL_FRAMES;
     }
 
-    // ------------------------------------------------------------ the screens still on vanilla
-
-    public static ItemStack withdraw() {
-        return new ItemStack(Items.BARRIER);
-    }
+    // ------------------------------------------------------------ the slots still on vanilla
 
     public static ItemStack divider() {
         return new ItemStack(Items.GRAY_STAINED_GLASS_PANE);
@@ -162,9 +190,5 @@ public final class Icons {
 
     public static ItemStack empty() {
         return new ItemStack(Items.LIGHT_GRAY_STAINED_GLASS_PANE);
-    }
-
-    public static ItemStack arrow() {
-        return new ItemStack(Items.ARROW);
     }
 }

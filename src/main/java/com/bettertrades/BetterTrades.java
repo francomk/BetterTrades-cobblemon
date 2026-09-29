@@ -11,6 +11,7 @@ import com.bettertrades.db.EscrowDb;
 import com.bettertrades.db.EscrowMigration;
 import com.bettertrades.db.Replay;
 import com.bettertrades.economy.MoneyService;
+import com.bettertrades.escrow.TradeJournal;
 import com.bettertrades.gui.Icons;
 import com.bettertrades.gui.MoneyInputGui;
 import com.bettertrades.lang.Lang;
@@ -26,6 +27,9 @@ public final class BetterTrades implements ModInitializer {
     public static final String MOD_ID = "bettertrades";
     public static final Logger LOGGER = LoggerFactory.getLogger("BetterTrades");
 
+    /** How long closed escrow rows and settled journal rows are kept before being pruned. */
+    private static final long ESCROW_RETENTION_MILLIS = java.util.concurrent.TimeUnit.DAYS.toMillis(30);
+
     @Override
     public void onInitialize() {
         BetterTradesConfig.load();
@@ -37,6 +41,7 @@ public final class BetterTrades implements ModInitializer {
         BetterTradesCommand.register();
 
         ServerLifecycleEvents.SERVER_STARTING.register(server -> {
+            TradeSessions.start();
             java.nio.file.Path configDirectory = FabricLoader.getInstance().getConfigDir().resolve(MOD_ID);
             java.nio.file.Path localDatabase = configDirectory.resolve("bettertrades.db");
             // Item escrow lives in a file of its own, always the same one, whatever backend is
@@ -56,7 +61,15 @@ public final class BetterTrades implements ModInitializer {
                 Blacklist.reload().thenCompose(ignored -> ApiKeys.reload());
             });
 
+            // The journal recovery is queued on the escrow thread right behind the open, so it lands
+            // before any login can look for HELD rows.
             EscrowDb.open(escrowDatabase)
+                    .thenCompose(ignored -> TradeJournal.recoverItems())
+                    .thenCompose(ignored -> TradeJournal.prune(ESCROW_RETENTION_MILLIS))
+                    .exceptionally(error -> {
+                        LOGGER.error("Trade journal recovery failed", error);
+                        return null;
+                    })
                     .thenCompose(ignored -> Database.open(localDatabase))
                     .thenCompose(ignored -> Blacklist.reload())
                     .thenCompose(ignored -> ApiKeys.reload())
@@ -69,12 +82,19 @@ public final class BetterTrades implements ModInitializer {
 
         // Impactor registers after the mods: asking it earlier would always get a no.
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
-            MoneyService.refreshAvailability();
+            // Held money of trades interrupted by the last stop is settled once Impactor answers.
+            MoneyService.refreshAvailability().thenAccept(available -> {
+                if (Boolean.TRUE.equals(available)) MoneyService.recover();
+            });
             // Once the server is up Cobblemon's config is loaded: before that it is not.
             TradeSessions.checkDistanceAgainstCobblemon();
             // Whether the screen's artwork will reach the players at all.
             Icons.checkPackDelivery();
         });
+
+        // Players are still connected here: trades in the middle of committing give back items and
+        // money to people who can still receive them.
+        ServerLifecycleEvents.SERVER_STOPPING.register(TradeSessions::drain);
 
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
             // Static state first, databases after: open sessions must be closed while escrow still
@@ -85,6 +105,8 @@ public final class BetterTrades implements ModInitializer {
             Blacklist.clear();
             MoneyInputGui.clearReads();
             ReadOnlyDb.close();
+            // Money before escrow: the deposits write their journal rows on the escrow thread.
+            MoneyService.close();
             Database.close();
             EscrowDb.close();
         });

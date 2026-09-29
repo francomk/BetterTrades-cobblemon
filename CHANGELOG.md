@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Pokémon picker redrawn with its own artwork, in the same style as the trade screen: a
+  "Choose a Pokemon" plaque, and the previous box, next box and back arrows as clickable buttons.
+- The box counter is now a Cobblemon Poké Ball in the middle of the bottom row; its tooltip shows
+  the current box.
+- Money input redrawn as a full screen: a coin frame on the left, the amount field with the back
+  and confirm buttons beside it, and the player inventory restyled to match.
+
 ## 0.1.0 — first release
 
 - Cobblemon player trades replaced with a server-side screen (Polymer + sgui), no client mod needed.

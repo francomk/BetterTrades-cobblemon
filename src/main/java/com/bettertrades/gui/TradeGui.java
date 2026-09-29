@@ -277,7 +277,7 @@ public final class TradeGui extends SimpleGuiBase {
         setStack(BUTTON_TRASH, Icons.trash(), Lang.name("gui.button.trash"),
                 Lang.lines("gui.button.trash.lore"));
 
-        setStack(BUTTON_POKEMON, Icons.addPokemon(), Lang.name("gui.button.pokemon"),
+        setStack(BUTTON_POKEMON, Icons.pokeBall(), Lang.name("gui.button.pokemon"),
                 Lang.lines("gui.button.pokemon.lore"));
 
         if (MoneyService.available()) {
@@ -387,10 +387,8 @@ public final class TradeGui extends SimpleGuiBase {
      * CLOSED - the close comes from the session, which has already finished. There is nothing to
      * cancel, and trying would bounce off the guard inside {@code cancel()} anyway.
      *
-     * COMMITTING - the money is already with the economy. Queueing a cancel here would mean taking
-     * the refund road, which is the only one that can really make money disappear if the economy
-     * does not answer. Both of them had confirmed the trade: it is left to finish, and the items
-     * arrive all the same. Cancels not chosen by the player - disconnect, distance, battle - stay
+     * COMMITTING - escrow is closed and the money is on its way to being held. Both of them had
+     * confirmed the trade: it is left to finish, and the items arrive all the same. Cancels not chosen by the player - disconnect, distance, battle - stay
      * queued as before: those cannot be ignored.
      */
     @Override

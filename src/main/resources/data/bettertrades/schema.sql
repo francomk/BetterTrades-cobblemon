@@ -161,6 +161,22 @@ CREATE TABLE IF NOT EXISTS escrow (
     FOREIGN KEY (item_id) REFERENCES item (identifier)
 ){OPTS};
 
+-- One row per trade that reached the commit, in the escrow file next to the rows it closes.
+-- It is what tells a restart what an interrupted trade had decided: OPEN (escrow closed, nothing
+-- moved yet), COMMITTED (items and Pokemon moving), DONE, ABORTED. The money columns describe the
+-- amount withdrawn from the payer and held until the trade decides who receives it.
+CREATE TABLE IF NOT EXISTS trade_journal (
+    trade_id     {ULID} NOT NULL,
+    state        {SHORT} NOT NULL,
+    payer_uuid   {UUID},
+    payee_uuid   {UUID},
+    amount       {BIGINT} NOT NULL,
+    money_state  {SHORT} NOT NULL,
+    created_at   {BIGINT} NOT NULL,
+    resolved_at  {BIGINT},
+    PRIMARY KEY (trade_id)
+){OPTS};
+
 CREATE TABLE IF NOT EXISTS blacklist_item (
     id          {ULID} NOT NULL,
     item_id     {IDENT} NOT NULL,
@@ -216,5 +232,8 @@ CREATE INDEX IF NOT EXISTS idx_trade_item_item ON trade_item (item_id);
 CREATE INDEX IF NOT EXISTS idx_trade_pokemon_trade ON trade_pokemon (trade_id);
 CREATE INDEX IF NOT EXISTS idx_trade_pokemon_species ON trade_pokemon (species_id);
 CREATE INDEX IF NOT EXISTS idx_escrow_open ON escrow (player_uuid, state);
+CREATE INDEX IF NOT EXISTS idx_escrow_trade ON escrow (trade_id, state);
+CREATE INDEX IF NOT EXISTS idx_trade_journal_state ON trade_journal (state);
+CREATE INDEX IF NOT EXISTS idx_escrow_resolved ON escrow (state, resolved_at);
 CREATE INDEX IF NOT EXISTS idx_blacklist_item_active ON blacklist_item (item_id, revoked_at);
 CREATE INDEX IF NOT EXISTS idx_blacklist_pokemon_active ON blacklist_pokemon (species_id, revoked_at);
